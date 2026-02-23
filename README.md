@@ -2,7 +2,8 @@
 
 This project features the simulation of a Polaris Gem E2 vehicle with **Ackermann steering capabilities**, developed using **ROS2** and **Gazebo Sim Ignition Fortress**. The model integrates a variety of sensors and navigation tools for autonomous operation.
 
-![Gazebo sim screenshot](src/gem_simulator/gem_gazebo/assets/Screenshot.png)
+![Gazebo sim screenshot](gem_gazebo/assets/Screenshot.png)
+
 ## Table of Contents
 
 <!--- - [Ackermann Steering Vehicle Simulation in ROS2 with Gazebo Sim Ignition](#ackermann-steering-vehicle-simulation-in-ros2-with-gazebo-sim-ignition) --->
