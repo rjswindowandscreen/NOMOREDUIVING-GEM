@@ -1,11 +1,8 @@
 # Gem Autonomous Electric Vehicle Simulator in ROS2 with Gazebo Sim Ignition
 
-This project features the simulation of a Polaris Gem E2 vehicle with **Ackermann steering capabilities**, developed using **ROS2** and the **Gazebo Sim Ignition environment**. The model integrates a variety of sensors and navigation tools for autonomous operation.
+This project features the simulation of a Polaris Gem E2 vehicle with **Ackermann steering capabilities**, developed using **ROS2** and **Gazebo Sim Ignition Fortress**. The model integrates a variety of sensors and navigation tools for autonomous operation.
 
-<!-- | **3D LiDAR Point Cloud Visualization** | **Warehouse Environment Model** |
-| ----- | ----- |
-| ![3D Point Cloud](saye_msgs/readme_files/3d_lidar_pointcloud.png) | ![Warehouse Model](saye_msgs/readme_files/warehouse_environment.png) | -->
-
+![Gazebo sim screenshot](src/gem_simulator/gem_gazebo/assets/Screenshot.png)
 ## Table of Contents
 
 <!--- - [Ackermann Steering Vehicle Simulation in ROS2 with Gazebo Sim Ignition](#ackermann-steering-vehicle-simulation-in-ros2-with-gazebo-sim-ignition) --->
@@ -78,7 +75,7 @@ This project features the simulation of a Polaris Gem E2 vehicle with **Ackerman
 ## Requirements
 
 - **ROS2 (Humble)**
-- **Gazebo Sim Ignition**
+- **Gazebo Sim Ignition Fortress**
 - **RViz2**
 - **ROS2_CONTROL**
 
@@ -114,7 +111,7 @@ This project features the simulation of a Polaris Gem E2 vehicle with **Ackerman
      ros2 launch gem_launch gem_init.launch.py
   
      # launch with parameters
-     ros2 launch gem_launch gem_init.launch.py x:=0 y:=0 yaw:=0.9 world_name:=silverstone.world
+     ros2 launch gem_launch gem_init.launch.py x:=0 y:=0 yaw:=-0.5 world_name:=sonoma_raceway.world
  ```
   ####  Control car:
   ```bash
@@ -124,7 +121,7 @@ This project features the simulation of a Polaris Gem E2 vehicle with **Ackerman
   
      # or for Teleop cmds
      source install/setup.zsh
-     ros2 launch gem_launch gem_drive.launch.py
+     ros2 launch gem_launch gem_drive.launch.py max_speed:=6.0
   ```
 
 <!-- ### 2. SLAM (Simultaneous Localization and Mapping)

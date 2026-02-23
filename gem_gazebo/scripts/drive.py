@@ -83,7 +83,7 @@ def main():
     parser.add_argument(
         "--max_speed",
         type=float,
-        default=5.0,
+        default=6.0,
         help="Max speed (m/s)",
     )
     parser.add_argument(

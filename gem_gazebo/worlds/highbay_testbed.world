@@ -50,6 +50,36 @@
       <uri>model://grass</uri>
       <pose>0 0 0 0 0 0</pose>
     </include>
+    <include>
+      <uri>model://construction_cone</uri>
+      <name>construction_cone_0</name>
+      <pose>11 -15 0.14 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://construction_cone</uri>
+      <name>construction_cone_1</name>
+      <pose>7 -17 0.14 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://construction_cone</uri>
+      <name>construction_cone_2</name>
+      <pose>14 -13 0.14 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://construction_cone</uri>
+      <name>construction_cone_3</name>
+      <pose>-49 -17 0.14 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://construction_cone</uri>
+      <name>construction_cone_4</name>
+      <pose>-52 -15 0.14 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://construction_cone</uri>
+      <name>construction_cone_5</name>
+      <pose>-54 -13 0.14 0 0 0</pose>
+    </include>
     <light name='sun' type='directional'>
       <pose>0 0 10 0 0 0</pose>
       <cast_shadows>true</cast_shadows>
