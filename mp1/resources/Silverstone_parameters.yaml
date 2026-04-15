@@ -1,0 +1,12 @@
+world:
+  scale: 3  # dimensionless
+  x: 0      # post-scale meters
+  y: 0      # post-scale meters
+  yaw: 0    # degrees
+
+lanes:
+  left:
+    offset: 1.65  # post-scale meters
+
+  right:
+    offset: -1.65 # post-scale meters
