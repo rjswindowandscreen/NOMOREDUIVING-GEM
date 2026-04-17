@@ -17,9 +17,9 @@ from simple_enet import SimpleENet
 
 ##### YOUR CODE STARTS HERE #####
 
-BATCH_SIZE = 8
+BATCH_SIZE = 2
 LR = 0.001
-EPOCHS = 10
+EPOCHS = 30
 TRAIN_VAL_SPLIT = 0.8
 CHECKPOINT_EVERY = 2 #epochs
 
