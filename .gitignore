@@ -4,3 +4,4 @@ install
 log
 __pycache__
 .vscode/
+src/perception/data/capture
