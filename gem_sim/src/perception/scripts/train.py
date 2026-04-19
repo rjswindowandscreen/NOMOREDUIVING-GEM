@@ -17,11 +17,11 @@ from simple_enet import SimpleENet
 
 ##### YOUR CODE STARTS HERE #####
 
-BATCH_SIZE = 2
-LR = 0.001
-EPOCHS = 30
+BATCH_SIZE = 4
+LR = 0.0001
+EPOCHS = 100
 TRAIN_VAL_SPLIT = 0.8
-CHECKPOINT_EVERY = 2 #epochs
+CHECKPOINT_EVERY = 10 #epochs
 
 def loss_fn(y, yp):
     """
