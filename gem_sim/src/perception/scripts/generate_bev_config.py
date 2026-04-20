@@ -27,7 +27,11 @@ def main():
     bev_height, bev_width = 15, 20
 
     # px -> m conversion factor
+    # tells the physical scale of each bev pixel
     unit_conversion_factor = (bev_height/bev_img_height, bev_width/bev_img_width)
+
+    # 4 points on the ground
+    # X = 0 to 15 m forward, and then y = -10m to +10m sideways
     bev_world_coords = np.float32([
         [bev_height, -bev_width/2, 0],
         [0, -bev_width/2, 0],
@@ -36,17 +40,29 @@ def main():
     ])
 
     # convert the bev_world_coords into pixel coordinates
-    src = []
+    src = [] # this is basically to asnwer: where the four world-rectangle corners appear in the front-facing camera image
     for pt in bev_world_coords:
         ##### YOUR CODE STARTS HERE #####
-        cam_pt = R @ (pt - t)    #    world coord to cam coord
+        # pt is [X, Y, Z] in world coordinates (Z should be 0 since it's on the ground)
+        Pw = pt.reshape(3, 1)                    
 
-        BEV_pt = K @ cam_pt    #    cam coord to 2D coord
-        #src.append(BEV_pt[:2]/BEV_pt[2])    #    remove homogenous and append
-        src.append((BEV_pt[0]/BEV_pt[2], (BEV_pt[1]/BEV_pt[2])))    #    remove homogenous and append  
-  
+        # world -> camera
+        Pc = R @ (Pw - t.reshape(3, 1) )
+        #Pc = R @ (Pw + t.reshape(3, 1) )            
+
+        # camera -> pixel (homogeneous)
+        p = K @ Pc                               
+
+        # normalize homogeneous coords
+        u = float(p[0, 0] / p[2, 0])
+        v = float(p[1, 0] / p[2, 0])
+
+        # u = float(p[0, 0])
+        # v = float(p[1, 0])
+
+        src.append([u, v])
         ##### YOUR CODE ENDS HERE #####
-        pass
+        # pass
     src = np.float32(src)
 
     output = {

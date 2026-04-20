@@ -17,11 +17,11 @@ from simple_enet import SimpleENet
 
 ##### YOUR CODE STARTS HERE #####
 
-BATCH_SIZE = 2
-LR = 0.001
-EPOCHS = 30
+BATCH_SIZE = 4
+LR = 0.0001
+EPOCHS = 60
 TRAIN_VAL_SPLIT = 0.8
-CHECKPOINT_EVERY = 2 #epochs
+CHECKPOINT_EVERY = 10 #epochs
 
 def loss_fn(y, yp):
     """
@@ -84,6 +84,7 @@ def train():
     
     with Progress() as progress:
         task = progress.add_task("[green]Training ...", total=EPOCHS * len(train_loader))
+        best_val_loss = 1
         for epoch in range(1, EPOCHS + 1):
             model = model.train()
 
@@ -139,9 +140,13 @@ def train():
             
             rich.print(f"Epoch {epoch}: Avg Train Loss: {avg_train_loss:.4f} Avg Val Loss: {avg_val_loss:.4f}")
 
-            if epoch % CHECKPOINT_EVERY == 0:
-                torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f"epoch{epoch}.pth"))
+            
+            if val_loss < best_val_loss and step > 50:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, 'best.pth'))
 
+            if epoch % CHECKPOINT_EVERY == 0:
+                torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, f'epoch{epoch}.pth'))
 
 if __name__ == '__main__':
     try:
