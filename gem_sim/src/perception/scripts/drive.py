@@ -216,12 +216,12 @@ def main():
     )
     parser.add_argument(
         "--max_speed",
-        default=5.0,
+        default=1.5,
         help="Max speed of gem"
     )
     parser.add_argument(
         "--max_steer",
-        default=0.8,
+        default=0.6,
         help="Max steer of gem"
     )
     parser.add_argument(

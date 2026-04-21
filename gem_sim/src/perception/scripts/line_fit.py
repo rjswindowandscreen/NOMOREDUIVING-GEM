@@ -120,7 +120,7 @@ def lane_fit(binary_warped, nwindows=20, margin=50, minpix=10):
     Returns dict with left_fit/right_fit (either may be None if not enough pixels).
     Returns None only if there are zero white pixels at all.
     """
-    MIN_PIXELS = 500
+    MIN_PIXELS = 200
 
     total_pixels = np.sum(binary_warped > 0)
     if total_pixels == 0:

@@ -20,7 +20,7 @@ from model_utils import load_model, inference
 import rich
 import cv2
 from scipy.spatial.transform import Rotation as R
-
+from std_msgs.msg import Float32MultiArray
 
 SMOOTH_N = 5
 
@@ -32,7 +32,7 @@ MAX_POSITION_JUMP = 150
 class LaneVisualizer(Node):
     def __init__(self):
         super().__init__("lane_visualizer")
-
+        self._lane_error_pub = self.create_publisher(Float32MultiArray, '/lane_error', 10)
         sim_time_param = Parameter('use_sim_time', Parameter.Type.BOOL, True)
         self.set_parameters([sim_time_param])
 
@@ -168,7 +168,9 @@ class LaneVisualizer(Node):
 
         w_str = f"{self._lane_width_px:.0f}px" if self._lane_width_px else "no_width_yet"
         print(f"EST XTE: {XTE_str} m  HE: {HE_str}°  lane_width: {w_str}")
-
+        lane_error_msg = Float32MultiArray()
+        lane_error_msg.data = [float(XTE), float(HE)]
+        self._lane_error_pub.publish(lane_error_msg)
         if combine_fit_img is None:
             combine_fit_img = image
 
