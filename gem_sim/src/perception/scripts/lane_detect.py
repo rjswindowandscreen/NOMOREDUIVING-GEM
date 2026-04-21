@@ -1,5 +1,4 @@
 import os
-import sys
 
 import torch
 import json
@@ -7,6 +6,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from tf2_ros.buffer import Buffer
@@ -14,93 +14,162 @@ from tf2_ros.transform_listener import TransformListener
 from rclpy.parameter import Parameter
 
 from worldgt import WorldGT
-from line_fit import lane_fit, final_viz, perspective_transform, \
-                    closest_point_on_polynomial, Line
+from line_fit import final_viz, perspective_transform
 from model_utils import load_model, inference
 import rich
 import cv2
 from scipy.spatial.transform import Rotation as R
-from std_msgs.msg import Float32MultiArray
 
-SMOOTH_N = 5
 
-# Max allowed x-position jump between frames (pixels at bottom of BEV).
-# Increase if turns cause false discards. Decrease if noise jumps through.
-MAX_POSITION_JUMP = 150
+def fit_left_lane(binary_warped, distance_power=1.0, min_pixels=50):
+    img_height, img_width = binary_warped.shape
+    car_y    = img_height
+    car_x    = img_width // 2
+    max_dist = np.sqrt(car_x**2 + car_y**2)
+
+    def center_weights(ys, xs):
+        dy           = ys - car_y
+        dx           = xs - car_x
+        dist         = np.sqrt(dx**2 + dy**2)
+        radial_w     = 1.0 - np.clip(dist / max_dist, 0, 1)
+        lateral_dist = np.abs(xs - car_x)
+        center_w     = 1.0 - np.clip(lateral_dist / car_x, 0, 1)
+        combined     = radial_w * 0.75 * center_w
+        return combined ** distance_power
+
+    def fit_poly(mask):
+        ys, xs = np.where(mask > 0)
+        if len(ys) < min_pixels:
+            return None, None, None
+        try:
+            w  = center_weights(ys, xs)
+            y  = ys.astype(np.float64)
+            cy = float(car_y)
+
+            # 4th order: x = Ay^4 + By^3 + Cy^2 + Dy + E
+            X   = np.column_stack([y**4, y**3, y**2, y, np.ones_like(y)])
+            W   = np.diag(w)
+            XtW = X.T @ W
+
+            # --- Soft slope constraint at car_y ---
+            # Derivative: 4A*cy^3 + 3B*cy^2 + 2C*cy + D = 0
+            # deriv_vec = [4*cy^3, 3*cy^2, 2*cy, 1, 0]
+            SLOPE_PENALTY = 3000.0
+            deriv_vec  = np.array([4*cy**3, 3*cy**2, 2*cy, 1.0, 0.0])
+            slope_pen  = SLOPE_PENALTY * np.outer(deriv_vec, deriv_vec)
+
+            # --- Penalize odd B coefficient (y^3 term) ---
+            # B causes asymmetric S-curves — penalize it heavily
+            # This keeps concavity roughly constant
+            B_PENALTY = 5000.0
+            b_pen = np.zeros((5, 5))
+            b_pen[1, 1] = B_PENALTY
+
+            # --- Penalize large A coefficient (y^4 term) ---
+            # Prevents extreme quartic bending
+            A_PENALTY = 50.0
+            a_pen = np.zeros((5, 5))
+            a_pen[0, 0] = A_PENALTY
+
+            # --- Tikhonov regularization for numerical stability ---
+            reg = np.eye(5) * 1e-4
+
+            A_mat  = XtW @ X + slope_pen + b_pen + a_pen + reg
+            b_vec  = XtW @ xs.astype(np.float64)
+            coeffs = np.linalg.solve(A_mat, b_vec)
+
+            return coeffs, float(ys.min()), float(ys.max())
+        except Exception:
+            return None, None, None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary_warped, connectivity=8)
+
+    BOTTOM_STRIP = 0.6
+    best_mask    = None
+    best_count   = 0
+
+    for i in range(1, num_labels):
+        component_mask = (labels == i).astype(np.uint8)
+        pixel_count    = int(np.sum(component_mask))
+        if pixel_count < 15:
+            continue
+        touches_bottom = np.any(component_mask[int(img_height * BOTTOM_STRIP):, :])
+        if not touches_bottom:
+            continue
+        if pixel_count > best_count:
+            best_count = pixel_count
+            best_mask  = component_mask
+
+    if best_mask is None:
+        return None
+
+    result = fit_poly(best_mask)
+    if result[0] is None:
+        return None
+
+    coeffs, y_min, y_max = result
+
+    ploty   = np.linspace(0, img_height - 1, img_height)
+    nonzero = binary_warped.nonzero()
+
+    return {
+        'left_coeffs': coeffs,
+        'left_fit':    lambda y: np.polyval(coeffs, y),
+        'left_y_min':  y_min,
+        'left_y_max':  y_max,
+        'ploty':       ploty,
+        'nonzerox':    np.array(nonzero[1]),
+        'nonzeroy':    np.array(nonzero[0]),
+    }
 
 
 class LaneVisualizer(Node):
     def __init__(self):
         super().__init__("lane_visualizer")
-        self._lane_error_pub = self.create_publisher(Float32MultiArray, '/lane_error', 10)
+
         sim_time_param = Parameter('use_sim_time', Parameter.Type.BOOL, True)
         self.set_parameters([sim_time_param])
 
         self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         try:
             self._model = load_model()
-            self._model = self._model.to(self._dev).eval()
-            rich.print("[green]loaded SimpleEnet :o")
+            if self._model is not None:
+                self._model = self._model.to(self._dev)
+                self._model = self._model.eval()
+                rich.print("[green]loaded SimpleEnet :o")
+            else:
+                self.get_logger().error(f"could not load SimpleEnet model x_X: {e}")
+                exit(1)
         except Exception as e:
-            self.get_logger().error(f"could not load SimpleEnet model: {e}")
+            self.get_logger().error(f"could not load SimpleEnet model x_X: {e}")
             exit(1)
 
         try:
             with open(os.path.join("data", "bev_config.json")) as f:
                 self._bev_cfg = json.load(f)
-        except FileNotFoundError as e:
-            self.get_logger().error(f"could not load bev config: {e}")
+        except FileNotFoundError:
+            self.get_logger().error(f"could not load bev config x_X: {e}")
             exit(1)
 
-        self._world = None
-        try:
-            self._world = WorldGT("Silverstone")
-        except Exception as e:
-            self.get_logger().warn(f"WorldGT unavailable: {e}")
-
-        self._tf_buf      = Buffer()
+        self._world = WorldGT("Silverstone")
+        self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
-        self._image_msg   = None
-        self._cv_bridge   = CvBridge()
 
-        # Temporal smoothing
-        self._left_line  = Line(n=SMOOTH_N)
-        self._right_line = Line(n=SMOOTH_N)
-
-        # Dynamic lane width tracking
-        self._lane_width_px   = None
-        self._lane_width_hist = []
-        self._lane_width_n    = 30
-
-        # Publishers
-        self._render_pub = self.create_publisher(Image, '/lane_render',    10)
-        self._bev_pub    = self.create_publisher(Image, '/lane_bev',       10)
-        self._debug_pub  = self.create_publisher(Image, '/lane_bev_debug', 10)
+        self._image_msg = None
+        self._cv_bridge  = CvBridge()
 
         self.create_subscription(
-            Image, "/camera/image_raw", self._on_image, 10
+            Image,
+            "/camera/image_raw",
+            self._on_image,
+            10
         )
 
-    def _update_lane_width(self, left_fit, right_fit, y_bottom):
-        left_x   = float(np.polyval(left_fit,  y_bottom))
-        right_x  = float(np.polyval(right_fit, y_bottom))
-        width_px = abs(right_x - left_x)
-        if 50 < width_px < 700:
-            self._lane_width_hist.append(width_px)
-            if len(self._lane_width_hist) > self._lane_width_n:
-                self._lane_width_hist.pop(0)
-            self._lane_width_px = float(np.mean(self._lane_width_hist))
-
-    def _position_is_consistent(self, fit, line_tracker, y_bottom):
-        """
-        Check 2 of Option 4: reject fits that jump too far from last frame.
-        last_x_bottom is now the actual polyval result, not just C.
-        """
-        if not line_tracker.detected or line_tracker.last_x_bottom is None:
-            return True
-        new_x  = float(np.polyval(fit, y_bottom))
-        last_x = line_tracker.last_x_bottom
-        return abs(new_x - last_x) <= MAX_POSITION_JUMP
+        self._lane_width    = None
+        self.COLLAPSE_THRESHOLD = 50
+        self._dilate_kernel = np.ones((3, 3), np.uint8)
+        self._last_ret      = None
 
     def _on_image(self, msg) -> None:
         self._image_msg = msg
@@ -108,171 +177,167 @@ class LaneVisualizer(Node):
             return
 
         image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
+        mask  = inference(self._model, image, self._dev)
+        m     = mask.astype(np.uint8) * 255
 
-        src_pts   = np.float32(self._bev_cfg["src"])
-        debug_img = image.copy()
-        for pt in src_pts:
-            cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 10, (0, 0, 255), -1)
-        cv2.polylines(debug_img, [src_pts.astype(np.int32)],
-                      isClosed=True, color=(0, 255, 0), thickness=2)
-        self._debug_pub.publish(
-            self._cv_bridge.cv2_to_imgmsg(debug_img, "bgr8")
-        )
+        cv2.imshow("raw_mask", m)
 
-        mask = inference(self._model, image, self._dev)
-        m    = mask.astype(np.uint8) * 255
-
-        combine_fit_img, binary_BEV, left_fit, right_fit = \
-            self.fit_poly_lanes(image, m)
+        combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
 
         binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
         binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
 
-        XTE_str = "N/A"
-        HE_str  = "N/A"
+        if ret:
+            left_fit      = ret['left_fit']
+            right_fit     = ret['right_fit']
+            center_fit    = ret['center_fit']
+            center_coeffs = ret['center_coeffs']
 
-        if left_fit is not None and right_fit is not None:
-            try:
-                poly_px = (np.add(left_fit, right_fit) / 2)
-                XTE, HE, camera_px, closest_px = self.compute_error(poly_px)
+            XTE, HE, camera_px, closest_px = self.compute_error(center_coeffs)
 
-                ploty       = np.linspace(0, binary_BEV.shape[0]-1, binary_BEV.shape[0])
-                left_fitx   = np.polyval(left_fit,  ploty)
-                center_fitx = np.polyval(poly_px,   ploty)
-                right_fitx  = np.polyval(right_fit, ploty)
+            ploty       = ret['ploty']
+            left_fitx   = np.array([float(left_fit(y))   for y in ploty])
+            center_fitx = np.array([float(center_fit(y)) for y in ploty])
+            right_fitx  = np.array([float(right_fit(y))  for y in ploty])
 
-                pts_left   = np.stack((left_fitx,   ploty), axis=1).astype(np.int32)
-                pts_center = np.stack((center_fitx, ploty), axis=1).astype(np.int32)
-                pts_right  = np.stack((right_fitx,  ploty), axis=1).astype(np.int32)
+            pts_left   = np.stack((left_fitx,    ploty), axis=1).astype(np.int32)
+            pts_center = np.stack((center_fitx,  ploty), axis=1).astype(np.int32)
+            pts_right  = np.stack((right_fitx,   ploty), axis=1).astype(np.int32)
 
-                cv2.polylines(binary_BEV, [pts_center], False, (0, 255, 255), 4)
-                cv2.polylines(binary_BEV, [pts_left],   False, (255, 0, 0),   4)
-                cv2.polylines(binary_BEV, [pts_right],  False, (0, 0, 255),   4)
+            cv2.polylines(binary_BEV, [pts_center], isClosed=False, color=(0, 255, 255), thickness=1)
+            cv2.polylines(binary_BEV, [pts_left],   isClosed=False, color=(255, 0, 0),   thickness=1)
+            cv2.polylines(binary_BEV, [pts_right],  isClosed=False, color=(0, 0, 255),   thickness=1)
 
-                cv2.circle(binary_BEV,
-                           (int(closest_px[0]), int(closest_px[1])), 8, (0,255,0), -1)
-                cv2.line(binary_BEV,
-                         (int(camera_px[0]), int(camera_px[1])),
-                         (int(closest_px[0]), int(closest_px[1])), (0,255,0), 4)
-                cv2.line(binary_BEV,
-                         (int(camera_px[0]), int(camera_px[1])),
-                         (int(camera_px[0]-20), int(camera_px[1]+20)), (255,0,255), 4)
-                cv2.line(binary_BEV,
-                         (int(camera_px[0]), int(camera_px[1])),
-                         (int(camera_px[0]+20), int(camera_px[1]+20)), (255,0,255), 4)
+            cv2.circle(binary_BEV,
+                       (int(closest_px[0]), int(closest_px[1])), 8, (0, 255, 0), -1)
+            cv2.line(binary_BEV,
+                     (int(camera_px[0]),  int(camera_px[1])),
+                     (int(closest_px[0]), int(closest_px[1])),
+                     (0, 255, 0), 4)
+            cv2.line(binary_BEV,
+                     (int(camera_px[0]), int(camera_px[1])),
+                     (int(camera_px[0] - 20), int(camera_px[1] + 20)),
+                     (255, 0, 255), 4)
+            cv2.line(binary_BEV,
+                     (int(camera_px[0]), int(camera_px[1])),
+                     (int(camera_px[0] + 20), int(camera_px[1] + 20)),
+                     (255, 0, 255), 4)
 
-                XTE_str = f"{XTE:.2f}"
-                HE_str  = f"{np.degrees(HE):.2f}"
-            except Exception as e:
-                self.get_logger().debug(f"compute_error failed: {e}")
+            XTE = f"{XTE:.2f}"
+            HE  = f"{np.degrees(HE):.2f}"
+        else:
+            XTE = "N/A"
+            HE  = "N/A"
 
-        w_str = f"{self._lane_width_px:.0f}px" if self._lane_width_px else "no_width_yet"
-        print(f"EST XTE: {XTE_str} m  HE: {HE_str}°  lane_width: {w_str}")
-        lane_error_msg = Float32MultiArray()
-        lane_error_msg.data = [float(XTE), float(HE)]
-        self._lane_error_pub.publish(lane_error_msg)
+        try:
+            trans = self._tf_buf.lookup_transform(
+                "silverstone", "stereo_camera_link", msg.header.stamp)
+            pos = trans.transform.translation
+            q   = trans.transform.rotation
+            rotation     = R.from_quat([q.x, q.y, q.z, q.w])
+            euler_angles = rotation.as_euler('xyz', degrees=False)
+            yaw  = euler_angles[2]
+            lane, _, gt_XTE, gt_HE = self._world.get_metrics(pos.x, pos.y, yaw)
+            gt_XTE = f"{gt_XTE:.2f}"
+            gt_HE  = f"{np.degrees(gt_HE):.2f}"
+        except Exception:
+            lane   = "unknown"
+            gt_XTE = "N/A"
+            gt_HE  = "N/A"
+
+        print(f"EST XTE: {XTE} m - HE: {HE}° -- GT XTE: {gt_XTE} m HE: {gt_HE}° - lane: {lane}")
+
         if combine_fit_img is None:
             combine_fit_img = image
 
-        self._render_pub.publish(
-            self._cv_bridge.cv2_to_imgmsg(
-                np.array(combine_fit_img, dtype=np.uint8), "bgr8")
-        )
-        self._bev_pub.publish(
-            self._cv_bridge.cv2_to_imgmsg(
-                np.array(binary_BEV, dtype=np.uint8), "bgr8")
-        )
+        cv2.imshow("render_view", combine_fit_img)
+        cv2.imshow("binary_BEV", binary_BEV)
+        cv2.waitKey(1)
 
-    def compute_error(self, poly_px):
+    def compute_error(self, center_coeffs):
         bev_height_m, bev_width_m = self._bev_cfg["bev_world_dim"]
         Sy, Sx = self._bev_cfg["unit_conversion_factor"]
-        scale  = np.array([Sx, Sy])
+        scale = np.array([Sx, Sy])
 
-        camera_m   = np.array([(bev_width_m / 2), bev_height_m])
-        camera_px  = camera_m / scale
-        closest_px = closest_point_on_polynomial(camera_px, poly_px)
-        closest_m  = closest_px * scale
+        camera_m  = np.array([(bev_width_m / 2), bev_height_m])
+        camera_px = camera_m / scale
 
-        XTE = np.linalg.norm(camera_m - closest_m)
-        if camera_m[0] > closest_m[0]:
-            XTE *= -1
+        # Closest point is directly horizontal from car
+        # since polynomial has near-zero slope at car_y
+        car_y_px    = camera_px[1]
+        center_x_px = float(np.polyval(center_coeffs, car_y_px))
+        closest_px  = np.array([center_x_px, car_y_px])
+        closest_m   = closest_px * scale
 
-        derivative  = np.polyder(poly_px)
-        slope_px    = np.polyval(derivative, closest_px[1])
-        slope_scale = scale[0] / scale[1]
-        HE = np.arctan(slope_px * slope_scale)
+        # XTE — purely horizontal signed distance
+        dx  = closest_m[0] - camera_m[0]
+        XTE = dx
 
-        return float(XTE), float(HE), camera_px, closest_px
+        # HE — analytical derivative at car_y
+        deriv    = np.polyder(center_coeffs)
+        slope_px = float(np.polyval(deriv, car_y_px))
+        slope_m  = slope_px * (Sx / Sy)
+
+        f     = np.array([0.0, -1.0])
+        t     = np.array([slope_m, -1.0])
+        cross = f[0]*t[1] - f[1]*t[0]
+        dot   = f[0]*t[0] + f[1]*t[1]
+        HE    = np.arctan2(cross, dot)
+
+        return XTE, HE, camera_px, closest_px
 
     def fit_poly_lanes(self, raw_img, binary_img):
         binary_warped, M, Minv = perspective_transform(
-            binary_img, np.float32(self._bev_cfg["src"])
-        )
-        ret = lane_fit(binary_warped)
+            binary_img, np.float32(self._bev_cfg["src"]))
+
+        binary_warped = cv2.dilate(binary_warped, self._dilate_kernel, iterations=1)
+
+        img_height = binary_warped.shape[0]
+        img_width  = binary_warped.shape[1]
+
+        ret = fit_left_lane(binary_warped)
+
+        if ret is not None:
+            left_coeffs = ret['left_coeffs']
+            try:
+                x_base = float(np.polyval(left_coeffs, img_height))
+                if not (0 < x_base < img_width):
+                    ret = None
+            except Exception:
+                ret = None
 
         if ret is None:
-            return None, binary_warped, None, None
+            if self._last_ret is not None:
+                return final_viz(raw_img,
+                                 self._last_ret['left_fit'],
+                                 self._last_ret['right_fit'],
+                                 Minv), binary_warped, self._last_ret
+            return None, binary_warped, None
 
-        left_fit_raw  = ret['left_fit']
-        right_fit_raw = ret['right_fit']
-        ploty         = ret['ploty']
-        y_bottom      = float(ploty[-1])
+        left_coeffs = ret['left_coeffs']
 
-        # ── Check 2: position consistency ─────────────────────────────────────
-        if left_fit_raw is not None:
-            if not self._position_is_consistent(left_fit_raw, self._left_line, y_bottom):
-                self.get_logger().debug("Left fit jumped too far — discarding")
-                left_fit_raw = None
+        if self._lane_width is None:
+            bev_height_m, bev_width_m = self._bev_cfg["bev_world_dim"]
+            Sy, Sx = self._bev_cfg["unit_conversion_factor"]
+            self._lane_width = 3.5 / Sx
+            self.get_logger().info(f"Lane width initialized: {self._lane_width:.1f} px")
 
-        if right_fit_raw is not None:
-            if not self._position_is_consistent(right_fit_raw, self._right_line, y_bottom):
-                self.get_logger().debug("Right fit jumped too far — discarding")
-                right_fit_raw = None
+        # Right and center coefficients
+        right_coeffs         = left_coeffs.copy()
+        right_coeffs[-1]    += self._lane_width
+        center_coeffs        = (left_coeffs + right_coeffs) / 2.0
 
-        # ── Both lanes reliable ───────────────────────────────────────────────
-        if left_fit_raw is not None and right_fit_raw is not None:
-            self._update_lane_width(left_fit_raw, right_fit_raw, y_bottom)
+        ret['left_fit']      = lambda y: np.polyval(left_coeffs,   y)
+        ret['right_fit']     = lambda y: np.polyval(right_coeffs,  y)
+        ret['center_fit']    = lambda y: np.polyval(center_coeffs, y)
+        ret['center_coeffs'] = center_coeffs
+        ret['center_y_min']  = ret['left_y_min']
+        ret['center_y_max']  = ret['left_y_max']
 
-            left_fit  = self._left_line.add_fit(left_fit_raw)
-            right_fit = self._right_line.add_fit(right_fit_raw)
+        self._last_ret = ret
 
-            # FIX: update last_x_bottom with actual polyval result, not C coeff
-            self._left_line.last_x_bottom  = float(np.polyval(left_fit,  y_bottom))
-            self._right_line.last_x_bottom = float(np.polyval(right_fit, y_bottom))
-
-            combine = final_viz(raw_img, left_fit, right_fit, Minv)
-            return combine, binary_warped, left_fit, right_fit
-
-        # ── One lane missing ──────────────────────────────────────────────────
-        if self._lane_width_px is None:
-            self.get_logger().debug("One lane missing, no width history yet")
-            return None, binary_warped, None, None
-
-        if left_fit_raw is None and right_fit_raw is not None:
-            right_fit = self._right_line.add_fit(right_fit_raw)
-            self._right_line.last_x_bottom = float(np.polyval(right_fit, y_bottom))
-            left_fit  = right_fit.copy()
-            left_fit[-1] -= self._lane_width_px
-            self._left_line.last_x_bottom = float(np.polyval(left_fit, y_bottom))
-            self.get_logger().debug(
-                f"Left missing — extrapolating (width={self._lane_width_px:.0f}px)"
-            )
-
-        elif right_fit_raw is None and left_fit_raw is not None:
-            left_fit  = self._left_line.add_fit(left_fit_raw)
-            self._left_line.last_x_bottom = float(np.polyval(left_fit, y_bottom))
-            right_fit = left_fit.copy()
-            right_fit[-1] += self._lane_width_px
-            self._right_line.last_x_bottom = float(np.polyval(right_fit, y_bottom))
-            self.get_logger().debug(
-                f"Right missing — extrapolating (width={self._lane_width_px:.0f}px)"
-            )
-
-        else:
-            return None, binary_warped, None, None
-
-        combine = final_viz(raw_img, left_fit, right_fit, Minv)
-        return combine, binary_warped, left_fit, right_fit
+        combine_fit_img = final_viz(raw_img, ret['left_fit'], ret['right_fit'], Minv)
+        return combine_fit_img, binary_warped, ret
 
 
 def main(args=None):
