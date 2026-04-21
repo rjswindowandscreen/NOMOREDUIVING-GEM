@@ -20,7 +20,7 @@ from std_msgs.msg import ColorRGBA
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from highbay_waypoints import WayPoints
+    from noisy_waypoints import WayPoints
 except ImportError:
     print('ERROR: highbay_waypoints.py not found')
     sys.exit(1)

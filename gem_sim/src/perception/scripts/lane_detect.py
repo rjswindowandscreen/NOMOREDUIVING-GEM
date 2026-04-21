@@ -8,6 +8,7 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float32MultiArray
 from cv_bridge import CvBridge
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -46,32 +47,22 @@ def fit_left_lane(binary_warped, distance_power=1.0, min_pixels=50):
             y  = ys.astype(np.float64)
             cy = float(car_y)
 
-            # 4th order: x = Ay^4 + By^3 + Cy^2 + Dy + E
             X   = np.column_stack([y**4, y**3, y**2, y, np.ones_like(y)])
             W   = np.diag(w)
             XtW = X.T @ W
 
-            # --- Soft slope constraint at car_y ---
-            # Derivative: 4A*cy^3 + 3B*cy^2 + 2C*cy + D = 0
-            # deriv_vec = [4*cy^3, 3*cy^2, 2*cy, 1, 0]
             SLOPE_PENALTY = 3000.0
             deriv_vec  = np.array([4*cy**3, 3*cy**2, 2*cy, 1.0, 0.0])
             slope_pen  = SLOPE_PENALTY * np.outer(deriv_vec, deriv_vec)
 
-            # --- Penalize odd B coefficient (y^3 term) ---
-            # B causes asymmetric S-curves — penalize it heavily
-            # This keeps concavity roughly constant
             B_PENALTY = 5000.0
             b_pen = np.zeros((5, 5))
             b_pen[1, 1] = B_PENALTY
 
-            # --- Penalize large A coefficient (y^4 term) ---
-            # Prevents extreme quartic bending
             A_PENALTY = 50.0
             a_pen = np.zeros((5, 5))
             a_pen[0, 0] = A_PENALTY
 
-            # --- Tikhonov regularization for numerical stability ---
             reg = np.eye(5) * 1e-4
 
             A_mat  = XtW @ X + slope_pen + b_pen + a_pen + reg
@@ -166,6 +157,9 @@ class LaneVisualizer(Node):
             10
         )
 
+        self._lane_error_pub = self.create_publisher(
+            Float32MultiArray, '/lane_error', 10)
+
         self._lane_width    = None
         self.COLLAPSE_THRESHOLD = 50
         self._dilate_kernel = np.ones((3, 3), np.uint8)
@@ -194,6 +188,11 @@ class LaneVisualizer(Node):
             center_coeffs = ret['center_coeffs']
 
             XTE, HE, camera_px, closest_px = self.compute_error(center_coeffs)
+
+            # Publish lane error for controller
+            lane_error_msg      = Float32MultiArray()
+            lane_error_msg.data = [float(XTE), float(HE)]
+            self._lane_error_pub.publish(lane_error_msg)
 
             ploty       = ret['ploty']
             left_fitx   = np.array([float(left_fit(y))   for y in ploty])
@@ -262,18 +261,14 @@ class LaneVisualizer(Node):
         camera_m  = np.array([(bev_width_m / 2), bev_height_m])
         camera_px = camera_m / scale
 
-        # Closest point is directly horizontal from car
-        # since polynomial has near-zero slope at car_y
         car_y_px    = camera_px[1]
         center_x_px = float(np.polyval(center_coeffs, car_y_px))
         closest_px  = np.array([center_x_px, car_y_px])
         closest_m   = closest_px * scale
 
-        # XTE — purely horizontal signed distance
         dx  = closest_m[0] - camera_m[0]
         XTE = dx
 
-        # HE — analytical derivative at car_y
         deriv    = np.polyder(center_coeffs)
         slope_px = float(np.polyval(deriv, car_y_px))
         slope_m  = slope_px * (Sx / Sy)
@@ -322,7 +317,6 @@ class LaneVisualizer(Node):
             self._lane_width = 3.5 / Sx
             self.get_logger().info(f"Lane width initialized: {self._lane_width:.1f} px")
 
-        # Right and center coefficients
         right_coeffs         = left_coeffs.copy()
         right_coeffs[-1]    += self._lane_width
         center_coeffs        = (left_coeffs + right_coeffs) / 2.0

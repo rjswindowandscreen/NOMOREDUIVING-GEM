@@ -24,7 +24,7 @@ from ackermann_msgs.msg import AckermannDrive
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from controller import VehicleController
+from controller_with_pid import VehicleController
 import util
 
 # ── Load waypoints ─────────────────────────────────────────────────────────────
@@ -108,7 +108,12 @@ class ControlNode(Node):
             )
 
         # Visualization plots
-        util.visualization(self, cur_time, speed=speed)
+        util.visualization(
+            self, cur_time,
+            speed=speed,
+            xte=self.controller.xte,
+            he=math.degrees(self.controller.he)
+        )
 
         # Check if all waypoints reached
         if self.controller.current_wp_idx >= len(self.waypoints) - 1:
