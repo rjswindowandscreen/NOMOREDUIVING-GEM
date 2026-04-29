@@ -239,7 +239,7 @@ class UpsamplingBottleneck(nn.Module):
         return self.out_activation(out)
 
 class SimpleENet(nn.Module):
-    def __init__(self, num_classes=2, encoder_relu=False, decoder_relu=True):
+    def __init__(self, num_classes=3, encoder_relu=False, decoder_relu=True):
         super(SimpleENet, self).__init__()
 
         self.initial_block = InitialBlock(1, 16, relu=encoder_relu)

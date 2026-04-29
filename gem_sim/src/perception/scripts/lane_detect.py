@@ -172,10 +172,17 @@ class LaneVisualizer(Node):
 
         image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
         mask  = inference(self._model, image, self._dev)
+
         m     = mask.astype(np.uint8) * 255
+        
+        vis = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
 
-        cv2.imshow("raw_mask", m)
+        vis[mask == 0] = [0, 0, 0]        # background (black)
+        vis[mask == 1] = [0, 255, 255]    # lane (yellow)
+        vis[mask == 2] = [0, 0, 255]      # obstacle (red)
 
+        cv2.imshow("raw_mask", vis)
+        
         combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
 
         binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))

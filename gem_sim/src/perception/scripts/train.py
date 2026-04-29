@@ -18,7 +18,7 @@ from simple_enet import SimpleENet
 ##### YOUR CODE STARTS HERE #####
 
 BATCH_SIZE = 4
-LR = 0.0001
+LR = 0.001
 EPOCHS = 110
 TRAIN_VAL_SPLIT = 0.8
 CHECKPOINT_EVERY = 10 #epochs
@@ -27,7 +27,7 @@ def loss_fn(y, yp):
     # Fixed weights — tune the lane weight (10.0) up or down
     # Too high = model outputs white too liberally
     # Too low = model outputs all black
-    weights = torch.tensor([1.0, 10.0]).to(yp.device)
+    weights = torch.tensor([1.0, 10.0, 5.0]).to(yp.device)
     return F.cross_entropy(yp, y, weight=weights)
     
 ##### YOUR CODE ENDS HERE #####
@@ -88,6 +88,8 @@ def train():
             val_loss = 0
 
             for (x, y) in train_loader:
+                # for c in range(3):
+                #     print(f"class {c} ratio:", (y == c).float().mean().item())
                 optimizer.zero_grad()
                 x = x.to(DEVICE)
                 y = y.to(DEVICE)

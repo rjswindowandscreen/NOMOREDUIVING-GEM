@@ -37,14 +37,27 @@ class CaptureDataset(Dataset):
     
     def __getitem__(self, idx: int) -> torch.Tensor:
         image = cv2.imread(os.path.join(self._image_dir, f"{idx}.png"))
-        mask = cv2.imread(os.path.join(self._mask_dir, f"{idx}.png"), cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(os.path.join(self._mask_dir, f"{idx}.png"))
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2RGB)
         if self._resize:
             image = cv2.resize(image, self._resize)
             mask = cv2.resize(mask, self._resize, interpolation=cv2.INTER_NEAREST)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         image = torch.from_numpy(image).float()[None, ...] / 255.0
-        mask = (torch.from_numpy(mask) / 255).long()
-        return image, mask
+        
+        class_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
+
+        # lane (yellow in RGB)
+        lane = np.all(mask == [255, 255, 0], axis=-1)
+        class_mask[lane] = 1
+
+        # obstacle (red in RGB)
+        obstacle = np.all(mask == [255, 0, 0], axis=-1)
+        class_mask[obstacle] = 2
+        class_mask = torch.from_numpy(class_mask).long()
+        # print("unique raw mask:", np.unique(mask.reshape(-1, 3), axis=0))
+        # print("class counts:", np.bincount(class_mask.flatten(), minlength=3))
+        return image, class_mask
 
     def read(self, idx: int) -> tuple[np.ndarray, dict]:
         image = cv2.imread(os.path.join(self._image_dir, f"{idx}.png"))

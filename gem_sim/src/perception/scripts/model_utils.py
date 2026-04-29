@@ -9,7 +9,7 @@ from simple_enet import SimpleENet
 
 # load your best model
 def load_model() -> SimpleENet:
-    path_to_your_model = "data/checkpoints/epoch110.pth"
+    path_to_your_model = "data/checkpoints/obstacle.pth"
     model = SimpleENet()
     model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
     return model
@@ -37,20 +37,28 @@ def inference(model: SimpleENet, image: np.ndarray, device: str) -> np.ndarray:
     tensor = tensor.to(device)
     
     j=0
+    
     model.eval()
     with torch.no_grad():
         pred = model(tensor)
+        
         prediction_output = torch.argmax(pred, dim=1)
         prediction_output = prediction_output.squeeze(0)
         mask = prediction_output
         pred = mask.cpu().numpy().astype(np.uint8)
 
-
-    
     
     masked_pred = cv2.resize(pred, (og_image.shape[1], og_image.shape[0]))
-
+    
     return masked_pred
 
+def colorize_mask(mask):
+    h, w = mask.shape
+    vis = np.zeros((h, w, 3), dtype=np.uint8)
 
+    vis[mask == 0] = [0, 0, 0]        # background (black)
+    vis[mask == 1] = [0, 255, 255]    # lane (yellow)
+    vis[mask == 2] = [0, 0, 255]      # obstacle (red)
+
+    return vis
 ##### YOUR CODE ENDS HERE #####

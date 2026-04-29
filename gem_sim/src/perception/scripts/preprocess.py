@@ -54,6 +54,10 @@ if __name__ == "__main__":
         image, _ = ds.read(i)
         thresh = mask_by_hsv(image, yellow_lane, [10, 100, 150])
 
+
+
+
+
         h, w = thresh.shape
         mask = np.zeros((h + 2, w + 2), np.uint8)
         floodfill = thresh.copy()
@@ -63,4 +67,39 @@ if __name__ == "__main__":
         top_region_mask = (floodfill == 128)
         thresh[top_region_mask] = 0
 
-        ds.write_mask(thresh, i)
+        orange_hsv = [15, 200, 200]   # orange
+        white_hsv  = [0, 0, 255]      # white (low saturation, high value)
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        orange_lower = np.array([0, 20, 100])   # super loose
+        orange_upper = np.array([40, 255, 255])
+
+        obstacle_thresh = cv2.inRange(hsv, orange_lower, orange_upper)
+
+        kernel = np.ones((5, 5), np.uint8)
+        lane_safe_mask = cv2.dilate(thresh, kernel, iterations=2)
+        obstacle_thresh[lane_safe_mask > 0] = 0
+
+        # cv2.imshow("image", image)
+        # cv2.imshow("lane", thresh)
+        # cv2.imshow("obstacle", obstacle_thresh)
+
+        # cv2.waitKey(0)  # or 0 if you want to step manually
+
+
+        final_mask = np.zeros((h, w), dtype=np.uint8) 
+        # Lane = 1 
+        final_mask[thresh > 0] = 255
+        # Obstacle = 2 
+        final_mask[obstacle_thresh > 0] = 100
+
+        vis = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Lane = yellow
+        vis[thresh >0] = [0, 255, 255]
+
+        # Obstacle = red
+        vis[obstacle_thresh >0] = [0, 0, 255]
+
+        ds.write_mask(vis, i)
