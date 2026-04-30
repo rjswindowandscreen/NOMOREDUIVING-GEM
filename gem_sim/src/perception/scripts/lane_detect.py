@@ -159,6 +159,8 @@ class LaneVisualizer(Node):
 
         self._lane_error_pub = self.create_publisher(
             Float32MultiArray, '/lane_error', 10)
+        self._obstacle_pub = self.create_publisher(
+            Float32MultiArray, '/obstacles', 10)
 
         self._lane_width    = None
         self.COLLAPSE_THRESHOLD = 50
@@ -173,7 +175,8 @@ class LaneVisualizer(Node):
         image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
         mask  = inference(self._model, image, self._dev)
 
-        m     = mask.astype(np.uint8) * 255
+        m     = np.zeros_like(mask, dtype=np.uint8)
+        m[mask == 1] = 255
         
         vis = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
 
@@ -183,8 +186,14 @@ class LaneVisualizer(Node):
 
         cv2.imshow("raw_mask", vis)
         
-        combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
 
+        obstacle_mask = np.zeros_like(mask, dtype=np.uint8)
+        obstacle_mask[mask == 2] = 255
+
+        combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
+        obstacle_detection = self.detect_obstacles(image, obstacle_mask)
+
+        
         binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
         binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
 
@@ -252,6 +261,27 @@ class LaneVisualizer(Node):
             gt_HE  = "N/A"
 
         print(f"EST XTE: {XTE} m - HE: {HE}° -- GT XTE: {gt_XTE} m HE: {gt_HE}° - lane: {lane}")
+        #### Publish obstacle info
+        obstacle_msg = Float32MultiArray()
+        if obstacle_detection:
+            for obstacle in obstacle_detection:
+                cx, cy = obstacle['centroid']
+                # Draw circles at obstacle locations
+                cv2.circle(binary_BEV, (cx, cy), 10, (0, 0, 255), -1)
+                obstacle_msg.data.extend([
+                    float(cx), 
+                    float(cy), 
+                    float(obstacle['area'])
+                ])
+                # Or draw bounding boxes
+                # pts = np.where(obstacle['mask'] > 0)
+                # x_min, x_max = pts[1].min(), pts[1].max()
+                # y_min, y_max = pts[0].min(), pts[0].max()
+                # cv2.rectangle(binary_BEV, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
+                print(f"Obstacle detected at ({cx}, {cy}) with area {obstacle['area']} px²")
+        
+        
+        self._obstacle_pub.publish(obstacle_msg)
 
         if combine_fit_img is None:
             combine_fit_img = image
@@ -287,7 +317,37 @@ class LaneVisualizer(Node):
         HE    = np.arctan2(cross, dot)
 
         return XTE, HE, camera_px, closest_px
+    
 
+    def detect_obstacles(self, raw_img, obstacle_mask):
+        """Detect and locate obstacles in the image"""
+        if obstacle_mask is None or np.sum(obstacle_mask) == 0:
+            return None
+        
+        # Find connected components for obstacles
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            obstacle_mask, connectivity=8)
+        
+        obstacles = []
+        for i in range(1, num_labels):  # Skip background (0)
+            component_mask = (labels == i).astype(np.uint8)
+            pixel_count = int(np.sum(component_mask))
+            
+            # Filter by minimum size (adjust threshold as needed)
+            if pixel_count < 50:
+                continue
+            
+            centroid = centroids[i]
+            x, y = int(centroid[0]), int(centroid[1])
+            area = pixel_count
+            
+            obstacles.append({
+                'centroid': (x, y),
+                'area': area,
+                'mask': component_mask
+            })
+        
+        return obstacles if obstacles else None
     def fit_poly_lanes(self, raw_img, binary_img):
         binary_warped, M, Minv = perspective_transform(
             binary_img, np.float32(self._bev_cfg["src"]))

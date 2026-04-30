@@ -46,6 +46,16 @@ class VehicleController:
             10
         )
 
+        self.obstacles = []
+        self.node.create_subscription(
+            Float32MultiArray,
+            "/obstacles",
+            self.obstacle_callback,
+            10
+        )
+        self.obstacle_stop_distance = 2.0  # meters — stop if obstacle closer than this
+        self.obstacle_slow_distance = 4.0  # meters — slow down if closer than this
+
         # ===== WAYPOINT FOLLOWING =====
         self.L = 1.75
         self.current_wp_idx = 0
@@ -84,6 +94,56 @@ class VehicleController:
         self.xte            = msg.data[0]
         self.he             = msg.data[1]
         self.last_lane_time = time.time()
+
+    def obstacle_callback(self, msg):
+        """Parse obstacle data [x1, y1, area1, x2, y2, area2, ...]"""
+        self.obstacles = []
+        for i in range(0, len(msg.data), 3):
+            if i + 2 < len(msg.data):
+                self.obstacles.append({
+                    'x': msg.data[i],
+                    'y': msg.data[i + 1],
+                    'area': msg.data[i + 2]
+                })
+
+    def is_obstacle_ahead(self, curr_x, curr_y, curr_yaw, min_distance=None):
+        """
+        Check if any obstacle is in front of the vehicle within detection range.
+        Returns: (is_ahead, closest_distance, obstacle_data)
+        """
+        if not self.obstacles:
+            return False, float('inf'), None
+
+        if min_distance is None:
+            min_distance = self.obstacle_stop_distance
+
+        closest_dist = float('inf')
+        closest_obs = None
+
+        for obs in self.obstacles:
+            obs_x = obs['x']
+            obs_y = obs['y']
+
+            # Vector from car to obstacle
+            dx = obs_x - curr_x
+            dy = obs_y - curr_y
+            dist = math.hypot(dx, dy)
+
+            # Angle from car to obstacle
+            obs_angle = math.atan2(dy, dx)
+
+            # Difference between obstacle angle and car heading
+            angle_diff = obs_angle - curr_yaw
+            while angle_diff >  math.pi: angle_diff -= 2 * math.pi
+            while angle_diff < -math.pi: angle_diff += 2 * math.pi
+
+            # Check if obstacle is roughly in front (within ±45°)
+            if abs(angle_diff) < math.pi / 4 and dist < closest_dist:
+                closest_dist = dist
+                closest_obs = obs
+
+        is_ahead = closest_dist < min_distance
+        return is_ahead, closest_dist, closest_obs
 
     # ── Extract vehicle info ──────────────────────────────────────────────────
     def extract_vehicle_info(self, currentPose):
@@ -237,6 +297,22 @@ class VehicleController:
         # ===== Speed =====
         self.speed = self.longitudinal_controller(
             curr_x, curr_y, curr_vel, curr_yaw, dense_path)
+        
+
+        # ===== OBSTACLE AVOIDANCE =====
+        obs_ahead, obs_distance, obs_data = self.is_obstacle_ahead(
+            curr_x, curr_y, curr_yaw)
+
+        if obs_ahead:
+            # Obstacle too close — STOP
+            self.speed = 0.0
+            print(f"!!!  OBSTACLE DETECTED {obs_distance:.2f}m ahead — STOPPING")
+        elif obs_distance < self.obstacle_slow_distance:
+            # Obstacle approaching — SLOW DOWN
+            slow_factor = obs_distance / self.obstacle_slow_distance
+            self.speed *= slow_factor
+            print(f"!!!  Obstacle {obs_distance:.2f}m ahead — slowing down")
+
 
         # ===== Blend Stanley + Pure Pursuit =====
         lane_fresh = (
