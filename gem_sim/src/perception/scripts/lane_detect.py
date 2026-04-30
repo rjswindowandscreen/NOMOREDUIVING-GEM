@@ -172,31 +172,46 @@ class LaneVisualizer(Node):
         if self._model is None:
             return
 
+        # --- IMAGE + SEGMENTATION ---
         image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
         mask  = inference(self._model, image, self._dev)
 
-        m     = np.zeros_like(mask, dtype=np.uint8)
+        m = np.zeros_like(mask, dtype=np.uint8)
         m[mask == 1] = 255
-        
+
         vis = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-
-        vis[mask == 0] = [0, 0, 0]        # background (black)
-        vis[mask == 1] = [0, 255, 255]    # lane (yellow)
-        vis[mask == 2] = [0, 0, 255]      # obstacle (red)
-
+        vis[mask == 0] = [0, 0, 0]
+        vis[mask == 1] = [0, 255, 255]
+        vis[mask == 2] = [0, 0, 255]
         cv2.imshow("raw_mask", vis)
-        
 
+        # --- OBSTACLE MASK ---
         obstacle_mask = np.zeros_like(mask, dtype=np.uint8)
         obstacle_mask[mask == 2] = 255
 
+        # --- LANE FIT (BEV) ---
         combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
-        obstacle_detection = self.detect_obstacles(image, obstacle_mask)
 
-        
+        # --- WARP OBSTACLES TO BEV (IMPORTANT) ---
+        obstacle_bev, _, _ = perspective_transform(
+            obstacle_mask, np.float32(self._bev_cfg["src"])
+        )
+
+        obstacle_detection = self.detect_obstacles(image, obstacle_bev)
+
+        # --- PREP BEV DISPLAY ---
         binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
         binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
 
+        # --- COMPUTE SCALE + CAMERA ORIGIN ---
+        bev_height_m, bev_width_m = self._bev_cfg["bev_world_dim"]
+        Sy, Sx = self._bev_cfg["unit_conversion_factor"]
+
+        scale = np.array([Sx, Sy])
+        camera_m = np.array([bev_width_m / 2, bev_height_m])
+        camera_px = camera_m / scale
+
+        # --- LANE ERROR ---
         if ret:
             left_fit      = ret['left_fit']
             right_fit     = ret['right_fit']
@@ -261,28 +276,66 @@ class LaneVisualizer(Node):
             gt_HE  = "N/A"
 
         print(f"EST XTE: {XTE} m - HE: {HE}° -- GT XTE: {gt_XTE} m HE: {gt_HE}° - lane: {lane}")
-        #### Publish obstacle info
+
+        # --- TF (SAFE) ---
+        yaw = 0.0
+        pos = type("obj", (), {"x": 0.0, "y": 0.0})()
+
+        try:
+            trans = self._tf_buf.lookup_transform(
+                "silverstone", "stereo_camera_link", msg.header.stamp)
+
+            pos = trans.transform.translation
+            q   = trans.transform.rotation
+
+            rotation = R.from_quat([q.x, q.y, q.z, q.w])
+            yaw = rotation.as_euler('xyz')[2]
+
+        except Exception as e:
+            self.get_logger().warn(f"TF failed: {e}")
+
+        print(f"EST XTE: {XTE} m - HE: {HE}°")
+
+        # --- OBSTACLE PUBLISH ---
         obstacle_msg = Float32MultiArray()
+
         if obstacle_detection:
             for obstacle in obstacle_detection:
                 cx, cy = obstacle['centroid']
-                # Draw circles at obstacle locations
-                cv2.circle(binary_BEV, (cx, cy), 10, (0, 0, 255), -1)
+
+                # Draw in BEV (debug)
+                cv2.circle(binary_BEV, (int(cx), int(cy)), 8, (0, 0, 255), -1)
+
+                # --- PIXEL → METERS ---
+                obs_px = np.array([cx, cy])
+                obs_m  = obs_px * scale
+
+                # --- RELATIVE TO CAR ---
+                obs_rel = obs_m - camera_m
+
+                # --- ROTATE INTO WORLD ---
+                Rmat = np.array([
+                    [np.cos(yaw), -np.sin(yaw)],
+                    [np.sin(yaw),  np.cos(yaw)]
+                ])
+
+                obs_world = Rmat @ obs_rel + np.array([pos.x, pos.y])
+
+                # --- STORE ---
                 obstacle_msg.data.extend([
-                    float(cx), 
-                    float(cy), 
+                    float(obs_world[0]),
+                    float(obs_world[1]),
                     float(obstacle['area'])
                 ])
-                # Or draw bounding boxes
-                # pts = np.where(obstacle['mask'] > 0)
-                # x_min, x_max = pts[1].min(), pts[1].max()
-                # y_min, y_max = pts[0].min(), pts[0].max()
-                # cv2.rectangle(binary_BEV, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
-                print(f"Obstacle detected at ({cx}, {cy}) with area {obstacle['area']} px²")
-        
-        
+
+                print(f"OBSTACLE WORLD: {obs_world}")
+
+        else:
+            obstacle_msg.data = []
+
         self._obstacle_pub.publish(obstacle_msg)
 
+        # --- VISUALIZATION ---
         if combine_fit_img is None:
             combine_fit_img = image
 

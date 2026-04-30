@@ -106,44 +106,30 @@ class VehicleController:
                     'area': msg.data[i + 2]
                 })
 
-    def is_obstacle_ahead(self, curr_x, curr_y, curr_yaw, min_distance=None):
-        """
-        Check if any obstacle is in front of the vehicle within detection range.
-        Returns: (is_ahead, closest_distance, obstacle_data)
-        """
+    def is_obstacle_ahead(self, curr_x, curr_y, curr_yaw, min_distance=5.0):
         if not self.obstacles:
-            return False, float('inf'), None
-
-        if min_distance is None:
-            min_distance = self.obstacle_stop_distance
+            return False, None, None
 
         closest_dist = float('inf')
         closest_obs = None
 
         for obs in self.obstacles:
-            obs_x = obs['x']
-            obs_y = obs['y']
+            x = obs['x']   # left/right
+            y = obs['y']   # forward is NEGATIVE
 
-            # Vector from car to obstacle
-            dx = obs_x - curr_x
-            dy = obs_y - curr_y
-            dist = math.hypot(dx, dy)
+            forward_dist = -y   # <-- FIX
+            lateral_dist = x
 
-            # Angle from car to obstacle
-            obs_angle = math.atan2(dy, dx)
+            # Only consider stuff roughly in front lane
+            if forward_dist > 0 and abs(lateral_dist) < 2.0:
+                if forward_dist < closest_dist:
+                    closest_dist = forward_dist
+                    closest_obs = obs
 
-            # Difference between obstacle angle and car heading
-            angle_diff = obs_angle - curr_yaw
-            while angle_diff >  math.pi: angle_diff -= 2 * math.pi
-            while angle_diff < -math.pi: angle_diff += 2 * math.pi
+        if closest_obs is not None and closest_dist < min_distance:
+            return True, closest_dist, closest_obs
 
-            # Check if obstacle is roughly in front (within ±45°)
-            if abs(angle_diff) < math.pi / 4 and dist < closest_dist:
-                closest_dist = dist
-                closest_obs = obs
-
-        is_ahead = closest_dist < min_distance
-        return is_ahead, closest_dist, closest_obs
+        return False, None, None
 
     # ── Extract vehicle info ──────────────────────────────────────────────────
     def extract_vehicle_info(self, currentPose):
@@ -307,7 +293,7 @@ class VehicleController:
             # Obstacle too close — STOP
             self.speed = 0.0
             print(f"!!!  OBSTACLE DETECTED {obs_distance:.2f}m ahead — STOPPING")
-        elif obs_distance < self.obstacle_slow_distance:
+        if obs_distance is not None and obs_distance < self.obstacle_slow_distance:
             # Obstacle approaching — SLOW DOWN
             slow_factor = obs_distance / self.obstacle_slow_distance
             self.speed *= slow_factor
