@@ -72,10 +72,44 @@ if __name__ == "__main__":
 
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        orange_lower = np.array([0, 20, 100])   # super loose
+        # ORANGE
+        orange_lower = np.array([0, 20, 100])
         orange_upper = np.array([40, 255, 255])
 
-        obstacle_thresh = cv2.inRange(hsv, orange_lower, orange_upper)
+        orange_mask = cv2.inRange(hsv, orange_lower, orange_upper)
+
+        # WHITE
+        white_lower = np.array([0, 0, 140])
+        white_upper = np.array([179, 100, 255])
+
+        white_mask = cv2.inRange(hsv, white_lower, white_upper)
+
+        # SHIFT ORANGE DOWNWARD
+        shift_pixels = 30
+
+        orange_shifted_down = np.zeros_like(orange_mask)
+        orange_shifted_down[shift_pixels:, :] = orange_mask[:-shift_pixels, :]
+
+        # EXPAND THE REGION BELOW ORANGE
+        kernel = np.ones((60, 40), np.uint8)
+
+        orange_below_region = cv2.dilate(
+            orange_shifted_down,
+            kernel,
+            iterations=1
+        )
+
+        # KEEP ONLY WHITE UNDER ORANGE
+        white_below_orange = cv2.bitwise_and(
+            white_mask,
+            orange_below_region
+        )
+
+        # COMBINE
+        obstacle_thresh = cv2.bitwise_or(
+            orange_mask,
+            white_below_orange
+        )
 
         kernel = np.ones((5, 5), np.uint8)
         lane_safe_mask = cv2.dilate(thresh, kernel, iterations=2)
