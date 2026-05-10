@@ -9,7 +9,7 @@ from simple_enet import SimpleENet
 
 # load your best model
 def load_model() -> SimpleENet:
-    path_to_your_model = "data/checkpoints/obstacle.pth"
+    path_to_your_model = "data/checkpoints/newObstacle.pth"
     model = SimpleENet()
     model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
     return model

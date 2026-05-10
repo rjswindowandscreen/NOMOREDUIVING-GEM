@@ -53,8 +53,8 @@ class VehicleController:
             self.obstacle_callback,
             10
         )
-        self.obstacle_stop_distance = 2.0  # meters — stop if obstacle closer than this
-        self.obstacle_slow_distance = 4.0  # meters — slow down if closer than this
+        self.obstacle_stop_distance = 9  # meters — stop if obstacle closer than this
+        self.obstacle_slow_distance = 15  # meters — slow down if closer than this
 
         # ===== WAYPOINT FOLLOWING =====
         self.L = 1.75
@@ -121,15 +121,15 @@ class VehicleController:
             lateral_dist = x
 
             # Only consider stuff roughly in front lane
-            if forward_dist > 0 and abs(lateral_dist) < 2.0:
+            if forward_dist > 0 and abs(lateral_dist) < 3.0:
                 if forward_dist < closest_dist:
                     closest_dist = forward_dist
                     closest_obs = obs
 
-        if closest_obs is not None and closest_dist < min_distance:
+        if closest_obs is not None and closest_dist < self.obstacle_stop_distance:
             return True, closest_dist, closest_obs
 
-        return False, None, None
+        return False, closest_dist, closest_obs
 
     # ── Extract vehicle info ──────────────────────────────────────────────────
     def extract_vehicle_info(self, currentPose):
@@ -293,10 +293,10 @@ class VehicleController:
             # Obstacle too close — STOP
             self.speed = 0.0
             print(f"!!!  OBSTACLE DETECTED {obs_distance:.2f}m ahead — STOPPING")
-        if obs_distance is not None and obs_distance < self.obstacle_slow_distance:
+        elif obs_distance is not None and obs_distance < self.obstacle_slow_distance:
             # Obstacle approaching — SLOW DOWN
             slow_factor = obs_distance / self.obstacle_slow_distance
-            self.speed *= slow_factor
+            self.speed = self.min_speed / 2.0
             print(f"!!!  Obstacle {obs_distance:.2f}m ahead — slowing down")
 
 
