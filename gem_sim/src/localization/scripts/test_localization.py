@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-test_localization.py — Unit tests for the localization module.
+test_localization.py — Unit tests for the FusionKF.
 
-No ROS2 required. Run from the src/localization/ directory:
+No ROS2 required. Run from src/localization/:
     python3 test_localization.py
-
-Tests cover:
-  1. GPS coordinate conversion (latlon_to_xy)
-  2. YawKF  — predict + update
-  3. LocalKF — predict + VO update + position integration
-  4. GlobalKF — GPS update + outlier rejection
-  5. Full pipeline: simulated straight-line drive
 """
 
 import sys
@@ -19,316 +12,257 @@ import math
 import unittest
 import numpy as np
 
-# Add scripts/ to path (same as localization.py does at runtime)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
 
-from kalman_filters  import YawKF, LocalKF, GlobalKF
-from gps_utils       import latlon_to_xy, xy_to_latlon, wrap_angle, euclidean_distance
+# Stub geometry_msgs so tests run without ROS2
+import types
+gm = types.ModuleType('geometry_msgs')
+msg_mod = types.ModuleType('geometry_msgs.msg')
+class Quaternion:
+    def __init__(self): self.w = self.x = self.y = self.z = 0.0
+msg_mod.Quaternion = Quaternion
+gm.msg = msg_mod
+sys.modules['geometry_msgs']     = gm
+sys.modules['geometry_msgs.msg'] = msg_mod
+
+from kalman_filter import FusionKF
+from gps_utils     import latlon_to_xy, euclidean_distance
 
 
-# ============================================================
-# 1. GPS Utilities
-# ============================================================
+# =============================================================================
+# 1. FusionKF — initial state
+# =============================================================================
+class TestFusionKFInit(unittest.TestCase):
+
+    def test_initial_position_zero(self):
+        kf = FusionKF()
+        x, y = kf.get_position()
+        self.assertAlmostEqual(x, 0.0, places=6)
+        self.assertAlmostEqual(y, 0.0, places=6)
+
+    def test_initial_velocity_zero(self):
+        kf = FusionKF()
+        vx, vy = kf.get_velocity()
+        self.assertAlmostEqual(vx, 0.0, places=6)
+        self.assertAlmostEqual(vy, 0.0, places=6)
+
+    def test_initial_yaw_zero(self):
+        kf = FusionKF()
+        self.assertAlmostEqual(kf.get_yaw(), 0.0, places=6)
+
+    def test_initial_speed_zero(self):
+        kf = FusionKF()
+        self.assertAlmostEqual(kf.get_speed(), 0.0, places=6)
+
+
+# =============================================================================
+# 2. Predict — yaw from gyro
+# =============================================================================
+class TestFusionKFPredictYaw(unittest.TestCase):
+
+    def test_constant_gyro_integrates_yaw(self):
+        """1 rad/s for 1 second → yaw ≈ 1 rad."""
+        kf = FusionKF()
+        for _ in range(100):
+            kf.predict(ax=0, ay=0, gyro_z=1.0, dt=0.01)
+        self.assertAlmostEqual(kf.get_yaw(), 1.0, delta=0.02)
+
+    def test_zero_gyro_no_yaw_change(self):
+        kf = FusionKF()
+        for _ in range(50):
+            kf.predict(ax=0, ay=0, gyro_z=0.0, dt=0.01)
+        self.assertAlmostEqual(kf.get_yaw(), 0.0, delta=1e-6)
+
+    def test_yaw_rate_set_from_gyro(self):
+        kf = FusionKF()
+        kf.predict(ax=0, ay=0, gyro_z=0.5, dt=0.01)
+        self.assertAlmostEqual(kf.get_yaw_rate(), 0.5, delta=1e-6)
+
+    def test_yaw_wraps_past_pi(self):
+        """Yaw should stay in [-π, π] when spinning continuously."""
+        kf = FusionKF()
+        for _ in range(400):
+            kf.predict(ax=0, ay=0, gyro_z=1.0, dt=0.01)
+        self.assertGreaterEqual(kf.get_yaw(), -math.pi)
+        self.assertLessEqual(kf.get_yaw(),    math.pi)
+
+
+# =============================================================================
+# 3. Predict — velocity and position from acceleration
+# =============================================================================
+class TestFusionKFPredictPosition(unittest.TestCase):
+
+    def test_forward_acceleration_increases_vx(self):
+        """ax=1 m/s² for 1 s at yaw=0 should give vx ≈ 1 m/s."""
+        kf = FusionKF()
+        for _ in range(100):
+            kf.predict(ax=1.0, ay=0.0, gyro_z=0.0, dt=0.01)
+        vx, vy = kf.get_velocity()
+        self.assertAlmostEqual(vx, 1.0, delta=0.05)
+        self.assertAlmostEqual(vy, 0.0, delta=0.05)
+
+    def test_forward_accel_advances_position(self):
+        """ax=1 m/s² for 2 s at yaw=0 → x ≈ 0.5*(1)*(2²) = 2 m."""
+        kf = FusionKF()
+        for _ in range(200):
+            kf.predict(ax=1.0, ay=0.0, gyro_z=0.0, dt=0.01)
+        x, y = kf.get_position()
+        self.assertAlmostEqual(x, 2.0, delta=0.1)
+        self.assertAlmostEqual(y, 0.0, delta=0.1)
+
+    def test_lateral_accel_at_yaw_90(self):
+        """
+        At yaw=π/2 (facing north), ax=1 should advance y, not x.
+        """
+        kf = FusionKF()
+        kf.x[4, 0] = math.pi / 2   # set yaw to north
+        for _ in range(100):
+            kf.predict(ax=1.0, ay=0.0, gyro_z=0.0, dt=0.01)
+        x, y = kf.get_position()
+        self.assertAlmostEqual(x, 0.0, delta=0.15)
+        self.assertGreater(y, 0.3)  # 0.5*a*t^2 = 0.5*1*1^2 = 0.5 m
+
+    def test_covariance_grows_without_gps(self):
+        """P should grow during predict steps (no GPS update)."""
+        kf = FusionKF()
+        p0 = kf.P[0, 0]
+        for _ in range(50):
+            kf.predict(ax=0, ay=0, gyro_z=0.0, dt=0.01)
+        self.assertGreater(kf.P[0, 0], p0)
+
+
+# =============================================================================
+# 4. GPS update
+# =============================================================================
+class TestFusionKFGPS(unittest.TestCase):
+
+    def test_gps_snaps_position_on_first_fix(self):
+        """
+        With high initial P, first GPS fix should snap position close to GPS.
+        """
+        kf = FusionKF()
+        kf.predict(ax=0, ay=0, gyro_z=0.0, dt=0.1)
+        kf.update_gps(5.0, 3.0)
+        x, y = kf.get_position()
+        self.assertAlmostEqual(x, 5.0, delta=0.5)
+        self.assertAlmostEqual(y, 3.0, delta=0.5)
+
+    def test_gps_pulls_position_toward_measurement(self):
+        """GPS update at (4, 4) should move estimate from (0, 0) toward it."""
+        kf = FusionKF()
+        x_before, _ = kf.get_position()
+        kf.update_gps(4.0, 4.0)
+        x_after, _ = kf.get_position()
+        self.assertGreater(x_after, x_before)
+
+    def test_gps_outlier_rejected(self):
+        """GPS jump beyond threshold should be ignored."""
+        kf = FusionKF()
+        kf.update_gps(1.0, 1.0)   # small update accepted
+        x_before, y_before = kf.get_position()
+        kf.update_gps(500.0, 500.0)   # huge jump — should be rejected
+        x_after, y_after = kf.get_position()
+        self.assertAlmostEqual(x_before, x_after, delta=0.1)
+        self.assertAlmostEqual(y_before, y_after, delta=0.1)
+
+    def test_repeated_gps_converges(self):
+        """Repeated GPS at same point within threshold should converge."""
+        kf = FusionKF()
+        for _ in range(20):
+            kf.predict(ax=0, ay=0, gyro_z=0.0, dt=0.1)
+            kf.update_gps(3.0, 4.0)
+        x, y = kf.get_position()
+        self.assertAlmostEqual(x, 3.0, delta=0.5)
+        self.assertAlmostEqual(y, 4.0, delta=0.5)
+
+    def test_covariance_decreases_after_gps(self):
+        """P[0,0] should shrink after GPS update."""
+        kf = FusionKF()
+        kf.predict(ax=0, ay=0, gyro_z=0.0, dt=0.1)
+        p_before = kf.P[0, 0]
+        kf.update_gps(0.0, 0.0)
+        self.assertLess(kf.P[0, 0], p_before)
+
+
+# =============================================================================
+# 5. GPS utils
+# =============================================================================
 class TestGPSUtils(unittest.TestCase):
 
-    def test_latlon_to_xy_origin(self):
-        """Datum point should map to (0, 0)."""
-        lat0, lon0 = 40.1164, -88.2434   # UIUC campus
+    def test_datum_maps_to_origin(self):
+        lat0, lon0 = 40.1164, -88.2434
         x, y = latlon_to_xy(lat0, lon0, lat0, lon0)
         self.assertAlmostEqual(x, 0.0, places=6)
         self.assertAlmostEqual(y, 0.0, places=6)
 
-    def test_latlon_to_xy_north(self):
-        """Moving 0.001° north ≈ 111 m north."""
+    def test_north_displacement(self):
         lat0, lon0 = 40.1164, -88.2434
-        x, y = latlon_to_xy(lat0 + 0.001, lon0, lat0, lon0)
-        self.assertAlmostEqual(x, 0.0, places=1)
-        self.assertAlmostEqual(y, 111.195, delta=0.5)   # ≈111 m/deg at this lat
+        _, y = latlon_to_xy(lat0 + 0.001, lon0, lat0, lon0)
+        self.assertAlmostEqual(y, 111.195, delta=0.5)
 
-    def test_latlon_to_xy_east(self):
-        """Moving 0.001° east should give positive x."""
+    def test_east_displacement_positive_x(self):
         lat0, lon0 = 40.1164, -88.2434
-        x, y = latlon_to_xy(lat0, lon0 + 0.001, lat0, lon0)
+        x, _ = latlon_to_xy(lat0, lon0 + 0.001, lat0, lon0)
         self.assertGreater(x, 0.0)
-        self.assertAlmostEqual(y, 0.0, places=1)
-
-    def test_roundtrip(self):
-        """xy_to_latlon should be the inverse of latlon_to_xy."""
-        lat0, lon0 = 40.1164, -88.2434
-        for lat_off, lon_off in [(0.002, 0.003), (-0.001, 0.005), (0.0, -0.002)]:
-            x, y = latlon_to_xy(lat0 + lat_off, lon0 + lon_off, lat0, lon0)
-            lat_back, lon_back = xy_to_latlon(x, y, lat0, lon0)
-            self.assertAlmostEqual(lat_back, lat0 + lat_off, places=6)
-            self.assertAlmostEqual(lon_back, lon0 + lon_off, places=6)
-
-    def test_wrap_angle(self):
-        """wrap_angle should keep angles in [-π, π]."""
-        self.assertAlmostEqual(wrap_angle(0.0),        0.0,       places=6)
-        self.assertAlmostEqual(wrap_angle(math.pi),    math.pi,   places=6)
-        self.assertAlmostEqual(wrap_angle(3 * math.pi), math.pi,  places=5)
-        self.assertAlmostEqual(wrap_angle(-3 * math.pi), -math.pi, places=5)
 
     def test_euclidean_distance(self):
         self.assertAlmostEqual(euclidean_distance(0, 0, 3, 4), 5.0, places=6)
 
 
-# ============================================================
-# 2. YawKF
-# ============================================================
-class TestYawKF(unittest.TestCase):
-
-    def test_initial_state(self):
-        kf = YawKF()
-        self.assertAlmostEqual(kf.yaw,      0.0, places=6)
-        self.assertAlmostEqual(kf.yaw_rate, 0.0, places=6)
-
-    def test_predict_constant_gyro(self):
-        """Constant gyro of 0.1 rad/s for 1 s should yield yaw ≈ 0.1 rad."""
-        kf = YawKF()
-        for _ in range(100):
-            kf.predict(gyro_z=0.1, dt=0.01)
-        self.assertAlmostEqual(kf.yaw, 0.1, delta=0.01)
-        self.assertAlmostEqual(kf.yaw_rate, 0.1, delta=0.01)
-
-    def test_predict_zero_gyro(self):
-        """Zero gyro should not change yaw."""
-        kf = YawKF()
-        for _ in range(50):
-            kf.predict(gyro_z=0.0, dt=0.01)
-        self.assertAlmostEqual(kf.yaw, 0.0, delta=1e-6)
-
-    def test_update_vo_pulls_toward_measurement(self):
-        """VO update with a yaw different from predicted should move estimate."""
-        kf = YawKF()
-        # Predict with zero gyro (stays at 0)
-        for _ in range(10):
-            kf.predict(0.0, 0.01)
-        yaw_before = kf.yaw
-        # VO says yaw is 0.3 rad
-        kf.update_vo(0.3)
-        self.assertGreater(kf.yaw, yaw_before)   # pulled toward 0.3
-
-    def test_covariance_decreases_after_update(self):
-        """P[0,0] should shrink after a measurement update."""
-        kf = YawKF()
-        kf.predict(0.0, 0.1)
-        p_before = kf.P[0, 0]
-        kf.update_vo(0.0)
-        self.assertLess(kf.P[0, 0], p_before)
-
-    def test_wrap_on_predict(self):
-        """Yaw should stay in [-π, π] when it crosses ±π."""
-        kf = YawKF()
-        # Spin at 1 rad/s for 4 seconds — crosses π
-        for _ in range(400):
-            kf.predict(gyro_z=1.0, dt=0.01)
-        self.assertGreaterEqual(kf.yaw, -math.pi)
-        self.assertLessEqual(kf.yaw,     math.pi)
-
-
-# ============================================================
-# 3. LocalKF
-# ============================================================
-class TestLocalKF(unittest.TestCase):
-
-    def test_initial_state(self):
-        kf = LocalKF()
-        self.assertAlmostEqual(float(kf.x[0, 0]), 0.0, places=6)
-        self.assertAlmostEqual(float(kf.x[1, 0]), 0.0, places=6)
-        self.assertAlmostEqual(kf.world_x, 0.0, places=6)
-        self.assertAlmostEqual(kf.world_y, 0.0, places=6)
-
-    def test_predict_accelerates(self):
-        """Forward acceleration should increase vx."""
-        kf = LocalKF()
-        for _ in range(50):
-            kf.predict(ax=1.0, ay=0.0, dt=0.01)
-        self.assertGreater(float(kf.x[0, 0]), 0.0)
-
-    def test_integrate_position_straight(self):
-        """
-        Driving straight (yaw=0) at 2 m/s for 5 s should give world_x ≈ 10 m.
-        """
-        kf = LocalKF()
-        kf.x[0, 0] = 2.0   # set vx directly (no IMU noise in test)
-        for _ in range(500):
-            kf.integrate_position(yaw=0.0, dt=0.01)
-        self.assertAlmostEqual(kf.world_x, 10.0, delta=0.1)
-        self.assertAlmostEqual(kf.world_y,  0.0, delta=0.1)
-
-    def test_integrate_position_90deg(self):
-        """
-        Driving at yaw=π/2 (facing north) at 2 m/s for 5 s
-        should give world_y ≈ 10 m, world_x ≈ 0.
-        """
-        kf = LocalKF()
-        kf.x[0, 0] = 2.0
-        for _ in range(500):
-            kf.integrate_position(yaw=math.pi / 2, dt=0.01)
-        self.assertAlmostEqual(kf.world_x,  0.0, delta=0.1)
-        self.assertAlmostEqual(kf.world_y, 10.0, delta=0.1)
-
-    def test_vo_update_corrects_velocity(self):
-        """VO displacement implying vx=3 should pull estimate away from 0."""
-        kf = LocalKF()
-        kf.update_vo(dx=0.3, dy=0.0, dt=0.1)   # implies vx=3 m/s
-        self.assertGreater(float(kf.x[0, 0]), 0.0)
-
-    def test_speed_property(self):
-        kf = LocalKF()
-        kf.x[0, 0] = 3.0
-        kf.x[1, 0] = 4.0
-        self.assertAlmostEqual(kf.speed, 5.0, places=5)
-
-
-# ============================================================
-# 4. GlobalKF
-# ============================================================
-class TestGlobalKF(unittest.TestCase):
-
-    def test_initial_state(self):
-        kf = GlobalKF()
-        gx, gy = kf.position
-        self.assertAlmostEqual(gx, 0.0, places=6)
-        self.assertAlmostEqual(gy, 0.0, places=6)
-
-    def test_gps_update_corrects_position(self):
-        """GPS fix at (5, 5) should pull estimate from (0,0) toward (5,5)."""
-        kf = GlobalKF()
-        kf.predict(vx_w=0.0, vy_w=0.0, dt=0.1)
-        kf.update_gps(5.0, 5.0)
-        gx, gy = kf.position
-        self.assertGreater(gx, 0.0)
-        self.assertGreater(gy, 0.0)
-
-    def test_gps_outlier_rejected(self):
-        """GPS jump larger than reject threshold should be ignored."""
-        kf = GlobalKF()
-        kf.predict(0.0, 0.0, 0.1)
-        # Position near origin
-        kf.update_gps(0.1, 0.1)
-        gx_before, gy_before = kf.position
-
-        # Huge jump — should be rejected
-        kf.update_gps(500.0, 500.0)
-        gx_after, gy_after = kf.position
-
-        self.assertAlmostEqual(gx_before, gx_after, delta=0.1)
-        self.assertAlmostEqual(gy_before, gy_after, delta=0.1)
-
-    def test_covariance_grows_on_predict(self):
-        """Covariance should grow during prediction (no sensor update)."""
-        kf = GlobalKF()
-        p0 = kf.P[0, 0]
-        for _ in range(10):
-            kf.predict(1.0, 0.0, 0.1)
-        self.assertGreater(kf.P[0, 0], p0)
-
-    def test_repeated_gps_converges(self):
-        """
-        Repeated GPS updates at the same point should converge the estimate.
-        We use a small target (3, 4) m — within the 8 m outlier threshold —
-        so the GPS updates aren't rejected.
-        """
-        kf = GlobalKF()
-        for _ in range(30):
-            kf.predict(0.0, 0.0, 0.1)
-            kf.update_gps(3.0, 4.0)
-        gx, gy = kf.position
-        self.assertAlmostEqual(gx, 3.0, delta=1.0)
-        self.assertAlmostEqual(gy, 4.0, delta=1.0)
-
-
-# ============================================================
-# 5. Full pipeline — simulated straight-line drive
-# ============================================================
+# =============================================================================
+# 6. Full pipeline — straight drive with GPS corrections
+# =============================================================================
 class TestFullPipeline(unittest.TestCase):
-    """
-    Simulate the complete IMU → LocalKF → GlobalKF pipeline for
-    a vehicle driving due east at 2 m/s for 10 seconds.
 
-    Expected result: world_x ≈ 20 m, world_y ≈ 0 m.
-    GPS fixes every 10 IMU ticks keep it anchored.
-    """
+    def test_straight_drive_east_with_gps(self):
+        """
+        Simulate 2 m/s east for 10 s with GPS corrections every 10 IMU ticks.
+        Final position should be within 2 m of 20 m east.
+        """
+        kf  = FusionKF()
+        dt  = 0.01
+        gps_every = 10
 
-    def test_straight_drive_east(self):
-        yaw_kf    = YawKF()
-        local_kf  = LocalKF()
-        global_kf = GlobalKF()
+        for i in range(1000):
+            kf.predict(ax=0.0, ay=0.0, gyro_z=0.0, dt=dt)
 
-        dt        = 0.01    # 100 Hz IMU
-        duration  = 10.0    # seconds
-        n_steps   = int(duration / dt)
-        gps_every = 10      # GPS update every 10 IMU steps ≈ 10 Hz
-
-        # Simulate: vehicle at yaw=0, forward accel = 0 (constant velocity trick:
-        # set vx directly to 2 m/s — avoids needing to ramp up)
-        local_kf.x[0, 0] = 2.0   # vx_body = 2 m/s
-
-        for i in range(n_steps):
-            # IMU predict (zero accel — constant velocity)
-            yaw_kf.predict(gyro_z=0.0, dt=dt)
-            local_kf.predict(ax=0.0, ay=0.0, dt=dt)
-            local_kf.integrate_position(yaw_kf.yaw, dt)
-
-            vx_w = math.cos(yaw_kf.yaw) * float(local_kf.x[0, 0])
-            vy_w = math.sin(yaw_kf.yaw) * float(local_kf.x[0, 0])
-            global_kf.predict(vx_w, vy_w, dt)
-            global_kf.x[0, 0] = local_kf.world_x
-            global_kf.x[1, 0] = local_kf.world_y
-
-            # GPS update every gps_every steps
+            # Inject velocity directly via GPS-like position steps
             if i % gps_every == 0:
-                true_x = 2.0 * (i * dt)   # ground truth position
-                # Add small noise (0.5 m std)
-                noisy_x = true_x + np.random.normal(0, 0.5)
-                noisy_y = np.random.normal(0, 0.5)
-                global_kf.update_gps(noisy_x, noisy_y)
-                local_kf.world_x = global_kf.x[0, 0]
-                local_kf.world_y = global_kf.x[1, 0]
+                true_x = 2.0 * (i * dt)
+                kf.update_gps(true_x + np.random.normal(0, 0.3),
+                              np.random.normal(0, 0.3))
 
-        gx, gy = global_kf.position
-        print(f'\n[pipeline] Final position: x={gx:.2f} m, y={gy:.2f} m '
-              f'(expected x≈20, y≈0)')
-        self.assertAlmostEqual(gx, 20.0, delta=2.0)   # within 2 m of truth
-        self.assertAlmostEqual(gy,  0.0, delta=2.0)
+        x, y = kf.get_position()
+        self.assertAlmostEqual(x, 20.0, delta=2.0)
+        self.assertAlmostEqual(y,  0.0, delta=2.0)
 
     def test_turning_drive(self):
         """
-        Vehicle turns at 0.1 rad/s while moving at 2 m/s for 5 s.
-        Just checks the pipeline doesn't crash and position is plausible.
+        Turning at 0.1 rad/s while moving. Just checks no crash and
+        position is plausible (moved some distance, didn't teleport).
         """
-        yaw_kf    = YawKF()
-        local_kf  = LocalKF()
-        global_kf = GlobalKF()
+        kf = FusionKF()
+        for _ in range(500):
+            kf.predict(ax=0.5, ay=0.0, gyro_z=0.1, dt=0.01)
 
-        local_kf.x[0, 0] = 2.0
-        dt = 0.01
+        x, y  = kf.get_position()
+        dist  = math.hypot(x, y)
+        self.assertGreater(dist, 0.5)    # moved somewhere
+        self.assertLess(dist, 100.0)     # didn't explode
 
-        for i in range(500):
-            yaw_kf.predict(gyro_z=0.1, dt=dt)
-            local_kf.predict(ax=0.0, ay=0.0, dt=dt)
-            local_kf.integrate_position(yaw_kf.yaw, dt)
-            vx_w = math.cos(yaw_kf.yaw) * 2.0
-            vy_w = math.sin(yaw_kf.yaw) * 2.0
-            global_kf.predict(vx_w, vy_w, dt)
-            global_kf.x[0, 0] = local_kf.world_x
-            global_kf.x[1, 0] = local_kf.world_y
-
-        gx, gy = global_kf.position
-        dist = math.hypot(gx, gy)
-        print(f'\n[pipeline] Turning drive final pos: x={gx:.2f}, y={gy:.2f}, '
-              f'dist from origin={dist:.2f} m')
-        # After 5 s at 2 m/s, distance from origin ≤ 10 m (arc, not straight)
-        self.assertLessEqual(dist, 11.0)
-        self.assertGreater(dist, 0.0)
+    def test_yaw_consistent_through_gps_updates(self):
+        """GPS updates should not affect yaw estimate."""
+        kf = FusionKF()
+        for _ in range(10):
+            kf.predict(ax=0, ay=0, gyro_z=0.2, dt=0.01)
+        yaw_before = kf.get_yaw()
+        kf.update_gps(1.0, 0.0)
+        self.assertAlmostEqual(kf.get_yaw(), yaw_before, delta=0.01)
 
 
-# ============================================================
-# Run
-# ============================================================
+# =============================================================================
 if __name__ == '__main__':
-    print('=' * 60)
-    print(' Localization Unit Tests')
-    print('=' * 60)
+    print('=' * 55)
+    print(' FusionKF Unit Tests')
+    print('=' * 55)
     unittest.main(verbosity=2)

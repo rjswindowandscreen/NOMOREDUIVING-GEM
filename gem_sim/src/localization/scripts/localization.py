@@ -1,35 +1,59 @@
 #!/usr/bin/env python3
 """
-localization_node.py — ROS2 node that fuses IMU + Visual Odometry + GPS
-into a single /odometry/global estimate for the GEM vehicle.
+localization_node.py — Fuses IMU + GPS + INS velocity into /odometry/global.
 
-Subscriptions
-  /imu/data          sensor_msgs/Imu          (high frequency ~100 Hz)
-  /camera/image_raw  sensor_msgs/Image        (camera frames for VO, optional)
-  /gps/fix           sensor_msgs/NavSatFix    (absolute GPS fix ~10 Hz)
+Subscriptions  (names from ros_topics.py)
+  /imu          sensor_msgs/Imu                         (~50 Hz) predict step
+  /navsatfix    sensor_msgs/NavSatFix                   (~40 Hz) position update
+  /twist_ins    geometry_msgs/TwistWithCovarianceStamped (~40 Hz) velocity update + ZUPT
 
 Publications
-  /odometry/global   nav_msgs/Odometry        (fused pose + velocity)
+  /odometry/global  nav_msgs/Odometry
 
-Parameters
-  use_camera  (bool, default True)
-      Set false to disable VO entirely — useful when testing GPS+IMU alone
-      or when the camera topic is noisy / occupied by the simulator.
-      Example: ros2 run ... --ros-args -p use_camera:=false
+Two key improvements over the basic IMU+GPS version:
+
+1. Gyro bias correction via ZUPT
+   The IMU gyro has a small constant offset (bias) that makes yaw drift even
+   when stationary. We detect stationary periods using /twist_ins speed, and
+   during those periods we update a running bias estimate using an exponential
+   moving average. The bias is subtracted from every gyro reading.
+   No fixed time window assumed — works whenever the car naturally stops.
+
+2. Velocity correction from Septentrio INS (/twist_ins)
+   Instead of relying on noisy IMU acceleration integration for velocity,
+   we use the Septentrio's fused velocity output directly as a KF update.
+   This eliminates the 0.2-0.5 m/s drift seen when stationary.
+   When the car is confirmed stationary, we also do a zero-velocity update
+   (ZUPT) with tight covariance to actively pull velocity to zero.
 """
 
+import os
+import sys
 import math
 import rclpy
 from rclpy.node import Node
 
-from sensor_msgs.msg import Imu, Image, NavSatFix
-from nav_msgs.msg   import Odometry
+from sensor_msgs.msg import Imu, NavSatFix
+from nav_msgs.msg    import Odometry
+from geometry_msgs.msg import TwistWithCovarianceStamped
 
-from cv_bridge import CvBridge
+from kalman_filter import FusionKF
+from gps_utils     import latlon_to_xy, euler_to_quat
 
-from kalman_filters  import YawKF, LocalKF, GlobalKF
-from visual_odometry import VisualOdometry
-from gps_utils       import latlon_to_xy, euler_to_quat
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from ros_topics import IMU_TOPIC, GPS_TOPIC, TWIST_INS_TOPIC, ODOM_TOPIC
+
+
+# ── ZUPT tuning ───────────────────────────────────────────────────────────────
+# car is considered stationary when INS speed stays below this for long enough
+STATIONARY_SPEED_THRESH = 0.05   # m/s — below this we might be stopped
+STATIONARY_CONFIRM_MSGS = 5      # need this many consecutive low-speed messages
+                                 # at ~40 Hz that's ~0.125 s — fast enough to
+                                 # catch a stop, slow enough to ignore noise
+
+# exponential moving average rate for gyro bias update
+# 0.02 means it takes ~50 stationary readings to fully converge (~1.25 s)
+BIAS_EMA_ALPHA = 0.02
 
 
 class LocalizationNode(Node):
@@ -37,46 +61,37 @@ class LocalizationNode(Node):
     def __init__(self):
         super().__init__('localization_node')
 
-        # ----- Parameters ---------------------------------------------------
-        self.declare_parameter('use_camera', True)
-        use_camera = self.get_parameter('use_camera').get_parameter_value().bool_value
+        self.kf = FusionKF()
 
-        # ----- Kalman Filters -----------------------------------------------
-        self.yaw_kf    = YawKF()
-        self.local_kf  = LocalKF()
-        self.global_kf = GlobalKF()
+        # GPS datum
+        self.lat0 = None
+        self.lon0 = None
 
-        # ----- Visual Odometry (only if camera enabled) ---------------------
-        self.vo     = VisualOdometry(n_features=500) if use_camera else None
-        self.bridge = CvBridge()
+        # IMU timing
+        self.last_imu_time = None
 
-        # ----- GPS datum (set on first valid fix) ---------------------------
-        self.lat0: float | None = None
-        self.lon0: float | None = None
+        # gyro bias state — updated automatically during stationary periods
+        self.gyro_bias        = 0.0
+        self.stationary_count = 0
+        self.is_stationary    = False
 
-        # ----- Timing -------------------------------------------------------
-        self.last_imu_time: float | None = None
-        self.last_cam_time: float | None = None
+        # subscribers
+        self.create_subscription(Imu,                        IMU_TOPIC,       self.imu_cb,       10)
+        self.create_subscription(NavSatFix,                  GPS_TOPIC,       self.gps_cb,       10)
+        self.create_subscription(TwistWithCovarianceStamped, TWIST_INS_TOPIC, self.twist_ins_cb, 10)
 
-        # ----- Subscribers --------------------------------------------------
-        self.create_subscription(Imu,       '/imu/data', self.imu_cb, 10)
-        self.create_subscription(NavSatFix, '/gps/fix',  self.gps_cb, 10)
+        # publisher
+        self.odom_pub = self.create_publisher(Odometry, ODOM_TOPIC, 10)
 
-        if use_camera:
-            self.create_subscription(Image, '/camera/image_raw', self.cam_cb, 10)
-            self.get_logger().info('Camera/VO enabled')
-        else:
-            self.get_logger().info('Camera/VO DISABLED (use_camera:=false)')
+        self.get_logger().info('LocalizationNode started')
+        self.get_logger().info(f'  IMU       : {IMU_TOPIC}')
+        self.get_logger().info(f'  GPS       : {GPS_TOPIC}')
+        self.get_logger().info(f'  INS vel   : {TWIST_INS_TOPIC}')
+        self.get_logger().info(f'  Output    : {ODOM_TOPIC}')
+        self.get_logger().info('Waiting for GPS datum...')
 
-        # ----- Publisher ----------------------------------------------------
-        self.odom_pub = self.create_publisher(Odometry, '/odometry/global', 10)
-
-        self.get_logger().info('LocalizationNode started — waiting for GPS datum...')
-
-    # -----------------------------------------------------------------------
-    # IMU callback — drives the predict loop at ~100 Hz
-    # -----------------------------------------------------------------------
-    def imu_cb(self, msg: Imu):
+    # -------------------------------------------------------------------------
+    def imu_cb(self, msg):
         now = self.get_clock().now().nanoseconds * 1e-9
 
         if self.last_imu_time is None:
@@ -93,68 +108,23 @@ class LocalizationNode(Node):
         ay     = msg.linear_acceleration.y
         gyro_z = msg.angular_velocity.z
 
-        # 1. Update yaw from gyro
-        self.yaw_kf.predict(gyro_z, dt)
+        # update gyro bias using EMA when car is confirmed stationary
+        # this happens naturally whenever the car stops — no time window needed
+        if self.is_stationary:
+            self.gyro_bias = (1.0 - BIAS_EMA_ALPHA) * self.gyro_bias \
+                           + BIAS_EMA_ALPHA * gyro_z
 
-        # 2. Predict body-frame velocity from IMU acceleration
-        self.local_kf.predict(ax, ay, dt)
+        # subtract bias before passing to KF
+        corrected_gyro_z = gyro_z - self.gyro_bias
 
-        # 3. Integrate world-frame position
-        self.local_kf.integrate_position(self.yaw_kf.yaw, dt)
+        self.kf.predict(ax, ay, corrected_gyro_z, dt)
+        self.publish_odom()
 
-        # 4. Propagate global KF (GPS corrects this at 5–10 Hz)
-        vx_w, vy_w = self._world_velocity()
-        self.global_kf.predict(vx_w, vy_w, dt)
-
-        # Sync global KF position with local integration
-        # (GPS feedback from gps_cb overrides this when a fix arrives)
-        self.global_kf.x[0, 0] = self.local_kf.world_x
-        self.global_kf.x[1, 0] = self.local_kf.world_y
-
-        self._publish_odom(now)
-
-    # -----------------------------------------------------------------------
-    # Camera callback — VO update (only called when use_camera=True)
-    # -----------------------------------------------------------------------
-    def cam_cb(self, msg: Image):
-        if self.vo is None:
-            return
-
-        now = self.get_clock().now().nanoseconds * 1e-9
-
-        if self.last_cam_time is None:
-            self.last_cam_time = now
-            return
-
-        dt = now - self.last_cam_time
-        self.last_cam_time = now
-
-        if dt <= 0 or dt > 1.0:
-            return
-
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        result = self.vo.update(frame, self.local_kf.speed, dt)
-
-        if result is None:
-            return
-
-        dx, dy, dyaw = result
-
-        # Correct yaw with VO heading estimate
-        vo_yaw = self.yaw_kf.yaw + dyaw
-        self.yaw_kf.update_vo(vo_yaw)
-
-        # Correct body-frame velocity with VO displacement
-        self.local_kf.update_vo(dx, dy, dt)
-
-    # -----------------------------------------------------------------------
-    # GPS callback — absolute position correction
-    # -----------------------------------------------------------------------
-    def gps_cb(self, msg: NavSatFix):
+    # -------------------------------------------------------------------------
+    def gps_cb(self, msg):
         if msg.status.status < 0:
             return
 
-        # Set datum from first valid fix
         if self.lat0 is None:
             self.lat0 = msg.latitude
             self.lon0 = msg.longitude
@@ -166,46 +136,67 @@ class LocalizationNode(Node):
         gps_x, gps_y = latlon_to_xy(
             msg.latitude, msg.longitude, self.lat0, self.lon0
         )
+        self.kf.update_gps(gps_x, gps_y)
 
-        # Correct global KF with absolute GPS position
-        self.global_kf.update_gps(gps_x, gps_y)
+    # -------------------------------------------------------------------------
+    def twist_ins_cb(self, msg):
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        speed = math.hypot(vx, vy)
 
-        # Feed GPS correction back into local KF world position
-        gx, gy = self.global_kf.position
-        self.local_kf.world_x = gx
-        self.local_kf.world_y = gy
+        # ── ZUPT detection ────────────────────────────────────────────────
+        # requires consecutive low-speed readings — avoids false triggers
+        # from brief GPS glitches or momentary noise
+        if speed < STATIONARY_SPEED_THRESH:
+            self.stationary_count += 1
+        else:
+            self.stationary_count = 0
+            self.is_stationary    = False
 
-    # -----------------------------------------------------------------------
-    def _world_velocity(self):
-        """Rotate body-frame velocity into world frame using current yaw."""
-        vx_b = self.local_kf.speed
-        vy_b = float(self.local_kf.x[1, 0])
-        yaw  = self.yaw_kf.yaw
-        vx_w =  math.cos(yaw) * vx_b - math.sin(yaw) * vy_b
-        vy_w =  math.sin(yaw) * vx_b + math.cos(yaw) * vy_b
-        return vx_w, vy_w
+        if self.stationary_count >= STATIONARY_CONFIRM_MSGS:
+            if not self.is_stationary:
+                self.get_logger().debug(
+                    f'Stationary detected — gyro bias: {self.gyro_bias:.5f} rad/s'
+                )
+            self.is_stationary = True
 
-    def _publish_odom(self, timestamp: float):
+        # ── velocity KF update ────────────────────────────────────────────
+        if self.is_stationary:
+            # ZUPT: car is confirmed stopped — force velocity to zero
+            # use very tight covariance since we are certain
+            self.kf.update_velocity(0.0, 0.0, cov_vx=0.01, cov_vy=0.01)
+        else:
+            # use INS velocity directly
+            # pull covariance from message if the driver provides it,
+            # otherwise fall back to a reasonable default
+            cov = msg.twist.covariance   # 6x6 flat row-major
+            cov_vx = cov[0] if cov[0] > 1e-9 else 0.1
+            cov_vy = cov[7] if cov[7] > 1e-9 else 0.1
+            self.kf.update_velocity(vx, vy, cov_vx=cov_vx, cov_vy=cov_vy)
+
+    # -------------------------------------------------------------------------
+    def publish_odom(self):
         msg = Odometry()
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
         msg.child_frame_id  = 'base_link'
 
-        gx, gy = self.global_kf.position
-        msg.pose.pose.position.x = gx
-        msg.pose.pose.position.y = gy
-        msg.pose.pose.position.z = 0.0
-        msg.pose.pose.orientation = euler_to_quat(self.yaw_kf.yaw)
+        x, y   = self.kf.get_position()
+        vx, vy = self.kf.get_velocity()
 
-        vx_w, vy_w = self._world_velocity()
-        msg.twist.twist.linear.x  = vx_w
-        msg.twist.twist.linear.y  = vy_w
-        msg.twist.twist.angular.z = self.yaw_kf.yaw_rate
+        msg.pose.pose.position.x  = x
+        msg.pose.pose.position.y  = y
+        msg.pose.pose.position.z  = 0.0
+        msg.pose.pose.orientation = euler_to_quat(self.kf.get_yaw())
+
+        msg.twist.twist.linear.x  = vx
+        msg.twist.twist.linear.y  = vy
+        msg.twist.twist.angular.z = self.kf.get_yaw_rate()
 
         self.odom_pub.publish(msg)
 
 
-# ---------------------------------------------------------------------------
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     rclpy.init()
     node = LocalizationNode()
