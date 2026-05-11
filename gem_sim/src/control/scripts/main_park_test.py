@@ -23,7 +23,7 @@ from park_control import ParkingController
 
 # --- CONFIGURATION ---
 # Set your desired parking spot coordinates here
-GOAL_X = -20.0
+GOAL_X = 0
 GOAL_Y = 0
 GOAL_YAW = 0 # 90 degrees (facing "up")
 # ---------------------
@@ -52,7 +52,6 @@ class ParkingRunner:
           
            # Start the parking maneuver using the current odom as start_pose
            success = self.node.start_parking(
-               start_pose=msg,
                goal_x=GOAL_X,
                goal_y=GOAL_Y,
                goal_yaw=GOAL_YAW
