@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Control main loop for Highbay Track.
-Adapted from MP2 main.py.
+Control main loop — Stanley + slow-speed + GPS goal stop.
 
 Usage:
     # Terminal 1
     ros2 launch gem_launch gem_init.launch.py
 
-    # Terminal 2 (after recording waypoints)
-    python3 src/control/scripts/main.py
+    # Terminal 2
+    python3 src/control/run_control.py
 """
 
 import math
@@ -20,26 +19,11 @@ import atexit
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from ackermann_msgs.msg import AckermannDrive
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from controller_with_pid import VehicleController
+from stanley_controller import StanleyController
 import util
-
-# ── Load waypoints ─────────────────────────────────────────────────────────────
-# Once you have run waypoint_recorder.py and generated highbay_waypoints.py,
-# this import will work. Until then it will raise an ImportError telling you
-# to record waypoints first.
-try:
-    from highbay_waypoints import WayPoints
-except ImportError:
-    print(
-        '\nERROR: highbay_waypoints.py not found.\n'
-        'Please record waypoints first:\n'
-        '  python3 src/control/scripts/waypoint_recorder.py\n'
-    )
-    sys.exit(1)
 
 
 class ControlNode(Node):
@@ -50,18 +34,13 @@ class ControlNode(Node):
         self.current_odom = None
         self.shutting_down = False
 
-        # Subscribe to odometry
-        self.create_subscription(Odometry, 'odom', self._odom_callback, 10)
+        # Localization output (fused IMU + GPS + INS)
+        self.create_subscription(Odometry, '/odometry/global', self._odom_callback, 10)
 
         # Controller
-        self.controller = VehicleController(node=self)
+        self.controller = StanleyController(node=self)
 
-        # Load waypoints
-        waypoints = WayPoints()
-        self.waypoints = waypoints.getWayPoints()
-        print(f'ControlNode: Loaded {len(self.waypoints)} waypoints.')
-
-        # Timing
+        # Timing for viz
         self.start_time     = self.get_clock().now()
         self.prev_plot_time = self.start_time
 
@@ -73,7 +52,7 @@ class ControlNode(Node):
         self.he_times    = []
         self.he_vals     = []
 
-        # Run at 100 Hz — same as MP2
+        # Run at 100 Hz
         self.timer = self.create_timer(0.01, self._run_loop)
         print('ControlNode: Ready. Running at 100 Hz.')
 
@@ -92,19 +71,18 @@ class ControlNode(Node):
         cur_time = self.get_clock().now()
         elapsed  = (cur_time - self.start_time).nanoseconds / 1e9
 
-        # Run controller
-        self.controller.execute(odom, self.waypoints)
+        self.controller.execute(odom)
 
         speed = self.controller.speed
 
-        # Print status every 5 seconds
+        # Status print every 5 s
         if not hasattr(self, '_last_print') or (elapsed - self._last_print) >= 5.0:
             self._last_print = elapsed
-            wp_idx = self.controller.current_wp_idx
             print(
                 f'[{elapsed:.1f}s] speed: {speed:.2f} m/s  '
-                f'wp: {wp_idx}/{len(self.waypoints)}  '
-                f'steering: {self.controller.steering:.3f} rad'
+                f'steer: {self.controller.steering:.3f} rad  '
+                f'XTE: {self.controller.xte:.2f}  '
+                f'goal_dist: {self.controller.last_goal_dist:.1f} m'
             )
 
         # Visualization plots
@@ -112,12 +90,13 @@ class ControlNode(Node):
             self, cur_time,
             speed=speed,
             xte=self.controller.xte,
-            he=math.degrees(self.controller.he)
+            he=math.degrees(self.controller.he),
         )
 
-        # Check if all waypoints reached
-        if self.controller.current_wp_idx >= len(self.waypoints) - 1:
-            print(f'\nCompleted track in {elapsed:.1f}s!')
+        # Arrival: near goal and stopped → exit
+        if self.controller.near_goal and abs(speed) < 0.05:
+            print(f'\nArrived at goal in {elapsed:.1f}s '
+                  f'(distance {self.controller.last_goal_dist:.2f} m).')
             self.controller.stop()
             os._exit(0)
 
