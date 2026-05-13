@@ -189,6 +189,10 @@ class LaneVisualizer(Node):
         obstacle_mask = np.zeros_like(mask, dtype=np.uint8)
         obstacle_mask[mask == 2] = 255
 
+        # Sign MASK
+        sign_mask = np.zeros_like(mask, dtype=np.uint8)
+        sign_mask[mask == 3] = 255
+
         # --- LANE FIT (BEV) ---
         combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
 
@@ -199,6 +203,14 @@ class LaneVisualizer(Node):
 
         obstacle_detection = self.detect_obstacles(image, obstacle_bev)
 
+
+
+        # --- WARP SIGNS TO BEV (IMPORTANT) ---
+        sign_bev, _, _ = perspective_transform(
+            sign_mask, np.float32(self._bev_cfg["src"])
+        )
+
+        sign_detection = self.detect_obstacles(image, obstacle_bev)
         # --- PREP BEV DISPLAY ---
         binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
         binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
@@ -369,7 +381,7 @@ class LaneVisualizer(Node):
         dot   = f[0]*t[0] + f[1]*t[1]
         HE    = np.arctan2(cross, dot)
 
-        return XTE, HE, camera_px, closest_px
+        return XTE, HE, camera_px, closest_pxobstacle
     
 
     def detect_obstacles(self, raw_img, obstacle_mask):

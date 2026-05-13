@@ -47,13 +47,17 @@ class CaptureDataset(Dataset):
         
         class_mask = np.zeros(mask.shape[:2], dtype=np.uint8)
 
-        # lane (yellow in RGB)
-        lane = np.all(mask == [255, 255, 0], axis=-1)
+        # lane (white in RGB)
+        lane = np.all(mask == [255, 255, 255], axis=-1)
         class_mask[lane] = 1
 
         # obstacle (red in RGB)
-        obstacle = np.all(mask == [255, 0, 0], axis=-1)
+        obstacle = np.all(mask == [0, 255, 255], axis=-1)
         class_mask[obstacle] = 2
+
+        # sign (red in RGB)
+        sign = np.all(mask == [255, 0, 0], axis=-1)
+        class_mask[sign] = 3
         class_mask = torch.from_numpy(class_mask).long()
         # print("unique raw mask:", np.unique(mask.reshape(-1, 3), axis=0))
         # print("class counts:", np.bincount(class_mask.flatten(), minlength=3))

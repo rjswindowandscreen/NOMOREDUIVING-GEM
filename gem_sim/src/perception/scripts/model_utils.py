@@ -57,8 +57,9 @@ def colorize_mask(mask):
     vis = np.zeros((h, w, 3), dtype=np.uint8)
 
     vis[mask == 0] = [0, 0, 0]        # background (black)
-    vis[mask == 1] = [0, 255, 255]    # lane (yellow)
-    vis[mask == 2] = [0, 0, 255]      # obstacle (red)
+    vis[mask == 1] = [255, 255, 255]    # lane (white)
+    vis[mask == 2] = [0, 255, 255]    # cone (yellow)
+    vis[mask == 3] = [0, 0, 255]      # sign (red)
 
     return vis
 ##### YOUR CODE ENDS HERE #####

@@ -121,7 +121,18 @@ if __name__ == "__main__":
 
         # cv2.waitKey(0)  # or 0 if you want to step manually
 
+        red_lower1 = np.array([0, 60, 60])
+        red_upper1 = np.array([15, 255, 255])
 
+        red_lower2 = np.array([175, 60, 60])
+        red_upper2 = np.array([179, 255, 255])
+
+        red_mask1 = cv2.inRange(hsv, red_lower1, red_upper1)
+        red_mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
+
+        sign_thresh = cv2.bitwise_or(red_mask1, red_mask2)
+
+        
         final_mask = np.zeros((h, w), dtype=np.uint8) 
         # Lane = 1 
         final_mask[thresh > 0] = 255
@@ -131,9 +142,14 @@ if __name__ == "__main__":
         vis = np.zeros((h, w, 3), dtype=np.uint8)
 
         # Lane = yellow
-        vis[thresh >0] = [0, 255, 255]
+        vis[thresh >0] = [255, 255, 255] 
 
+
+
+        vis[sign_thresh >0] = [0, 0, 255]
+        
         # Obstacle = red
-        vis[obstacle_thresh >0] = [0, 0, 255]
+        vis[obstacle_thresh >0] = [0, 255, 255] 
+
 
         ds.write_mask(vis, i)
