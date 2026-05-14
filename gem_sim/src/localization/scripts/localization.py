@@ -41,7 +41,10 @@ from kalman_filter import FusionKF
 from gps_utils     import latlon_to_xy, euler_to_quat
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from ros_topics import IMU_TOPIC, GPS_TOPIC, TWIST_INS_TOPIC, ODOM_TOPIC
+# topics.py: localization/scripts/ -> localization/ -> src/
+import sys as _loc_sys
+_loc_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+from topics import IMU as IMU_TOPIC, NAVSATFIX as GPS_TOPIC, TWIST_INS as TWIST_INS_TOPIC, REAL_ODOM as ODOM_TOPIC
 
 
 # ── ZUPT tuning ───────────────────────────────────────────────────────────────
